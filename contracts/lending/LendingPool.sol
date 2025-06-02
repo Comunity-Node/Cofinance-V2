@@ -8,23 +8,21 @@ import "../oracle/CustomPriceOracle.sol";
 
 contract LendingPool is AccessControl {
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
-
     IERC20 public immutable token0;
     IERC20 public immutable token1;
     CustomPriceOracle public immutable priceOracle;
     LiquidationLogic public immutable liquidationLogic;
 
-    // Mapping to track borrowed amounts (token0 or token1)
     mapping(address => uint256) public borrowed;
-    // Mapping to track collateral amounts (token0 or token1)
     mapping(address => uint256) public collateral;
-    // Mapping to track which token is borrowed
     mapping(address => address) public borrowedToken;
-    // Mapping to track which token is used as collateral
     mapping(address => address) public collateralToken;
 
     event Borrow(address indexed borrower, address token, uint256 amount, address collateralToken, uint256 collateralAmount);
     event Liquidated(address indexed user, uint256 debtAmount, uint256 collateralAmount);
+    event Repaid(address indexed borrower, uint256 amount);
+    event CollateralAdded(address indexed user, uint256 amount);
+    event CollateralWithdrawn(address indexed user, uint256 amount);
 
     constructor(
         address _token0,
@@ -45,6 +43,7 @@ contract LendingPool is AccessControl {
     }
 
     function borrow(
+        address borrower,
         address token,
         uint256 amount,
         address collateralTokenAddress,
@@ -53,21 +52,54 @@ contract LendingPool is AccessControl {
         require(amount > 0 && collateralAmount > 0, "Invalid amounts");
         require(token == address(token0) || token == address(token1), "Invalid token");
         require(collateralTokenAddress == address(token0) || collateralTokenAddress == address(token1), "Invalid collateral");
-        require(borrowed[msg.sender] == 0, "Existing borrow"); // One borrow per user for simplicity
+        require(borrowed[borrower] == 0, "Existing borrow");
 
         uint256 collateralValue = (collateralAmount * priceOracle.getPrice(collateralTokenAddress)) / 1e18;
         uint256 borrowValue = (amount * priceOracle.getPrice(token)) / 1e18;
-        require(collateralValue >= borrowValue * 150 / 100, "Insufficient collateral"); // 150% collateralization
-
+        require(collateralValue >= borrowValue * 150 / 100, "Insufficient collateral"); 
         IERC20(collateralTokenAddress).transferFrom(msg.sender, address(this), collateralAmount);
-        IERC20(token).transfer(msg.sender, amount);
+        IERC20(token).transfer(borrower, amount);
 
-        borrowed[msg.sender] = amount;
-        collateral[msg.sender] = collateralAmount;
-        borrowedToken[msg.sender] = token;
-        collateralToken[msg.sender] = collateralTokenAddress;
+        borrowed[borrower] = amount;
+        collateral[borrower] = collateralAmount;
+        borrowedToken[borrower] = token;
+        collateralToken[borrower] = collateralTokenAddress;
 
-        emit Borrow(msg.sender, token, amount, collateralTokenAddress, collateralAmount);
+        emit Borrow(borrower, token, amount, collateralTokenAddress, collateralAmount);
+    }
+
+    function repay(address borrower, uint256 amount) external {
+        require(borrowed[borrower] >= amount, "Invalid repay amount");
+        require(borrowedToken[borrower] != address(0), "No borrow position");
+        IERC20(borrowedToken[borrower]).transferFrom(msg.sender, address(this), amount);
+        borrowed[borrower] -= amount;
+        if (borrowed[borrower] == 0) {
+            borrowedToken[borrower] = address(0);
+            collateralToken[borrower] = address(0);
+        }
+        emit Repaid(borrower, amount);
+    }
+
+    function addCollateral(address user, uint256 amount) external {
+        require(amount > 0, "Invalid amount");
+        require(collateralToken[user] != address(0), "No existing position");
+        IERC20(collateralToken[user]).transferFrom(msg.sender, address(this), amount);
+        collateral[user] += amount;
+        emit CollateralAdded(user, amount);
+    }
+
+    function withdrawCollateral(address user, uint256 amount) external {
+        require(collateral[user] >= amount, "Insufficient collateral");
+        uint256 collateralValue = ((collateral[user] - amount) * priceOracle.getPrice(collateralToken[user])) / 1e18;
+        uint256 borrowValue = (borrowed[user] * priceOracle.getPrice(borrowedToken[user])) / 1e18;
+        require(collateralValue >= borrowValue * 150 / 100 || borrowed[user] == 0, "Insufficient collateral after withdrawal");
+        collateral[user] -= amount;
+        IERC20(collateralToken[user]).transfer(user, amount);
+        if (collateral[user] == 0 && borrowed[user] == 0) {
+            collateralToken[user] = address(0);
+            borrowedToken[user] = address(0);
+        }
+        emit CollateralWithdrawn(user, amount);
     }
 
     function liquidatePosition(address user, uint256 debtAmount, uint256 collateralAmount) external {
@@ -77,8 +109,6 @@ contract LendingPool is AccessControl {
 
         borrowed[user] -= debtAmount;
         collateral[user] -= collateralAmount;
-
-        // Clear token mappings if fully liquidated
         if (borrowed[user] == 0) {
             borrowedToken[user] = address(0);
             collateralToken[user] = address(0);
@@ -87,7 +117,6 @@ contract LendingPool is AccessControl {
         emit Liquidated(user, debtAmount, collateralAmount);
     }
 
-    // Renamed getters to avoid conflict with state variables
     function getToken0() external view returns (address) {
         return address(token0);
     }

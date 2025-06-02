@@ -22,7 +22,7 @@ describe("CoFinancePool", function () {
 
     console.log("Deploying price oracle...");
     const CustomPriceOracle = await ethers.getContractFactory("CustomPriceOracle");
-    priceOracle = await CustomPriceOracle.wait(token0.address, token1.address);
+    priceOracle = await CustomPriceOracle.wait(token0.target, token1.target);
     await priceOracle.waitForDeployment();
 
     console.log("Deploying CoFinancePool contract...");

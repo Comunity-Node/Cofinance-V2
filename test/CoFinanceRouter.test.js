@@ -3,7 +3,7 @@ const { ethers } = require("hardhat");
 
 describe("CoFinanceRouter", function () {
   let factory, router, deployer, user1, tokenA, tokenB, priceOracle, swapMath, tickMath, liquidityMath;
-  let pool, lendingPool, liquidityToken;
+  let pool, lendingPool, liquidityToken, liquidationLogic;
 
   beforeEach(async function () {
     [deployer, user1] = await ethers.getSigners();
@@ -32,22 +32,40 @@ describe("CoFinanceRouter", function () {
     const PriceOracle = await ethers.getContractFactory("CustomPriceOracle");
     priceOracle = await PriceOracle.deploy(tokenA.target, tokenB.target);
     await priceOracle.waitForDeployment();
-
-    // Deploy liquidation logic
-    const LiquidationLogic = await ethers.getContractFactory("LiquidationLogic");
-    const liquidationLogic = await LiquidationLogic.deploy();
-    await liquidationLogic.waitForDeployment();
+    await priceOracle.setPrices(ethers.parseEther("1"), ethers.parseEther("1")); // 1:1 price
 
     // Deploy factory
-    const Factory = await ethers.getContractFactory("CoFinanceFactory", {
+   const Factory = await ethers.getContractFactory("CoFinanceFactory", {
       libraries: {
         SwapMath: swapMath.target,
-        TickMath: tickMath.target,
-        LiquidityMath: liquidityMath.target,
       },
     });
+
     factory = await Factory.deploy();
     await factory.waitForDeployment();
+
+    // Deploy liquidation logic with a placeholder lending pool address
+    const LiquidationLogic = await ethers.getContractFactory("LiquidationLogic");
+    liquidationLogic = await LiquidationLogic.deploy(ethers.ZeroAddress, priceOracle.target);
+    await liquidationLogic.waitForDeployment();
+
+    // Deploy lending pool with correct liquidation logic
+    const LendingPool = await ethers.getContractFactory("LendingPool");
+    lendingPool = await LendingPool.deploy(
+      tokenA.target,
+      tokenB.target,
+      priceOracle.target,
+      liquidationLogic.target
+    );
+    await lendingPool.waitForDeployment();
+
+    // Update factory lending pool mapping
+    await factory.connect(deployer).createLendingPool(
+      tokenA.target,
+      tokenB.target,
+      priceOracle.target,
+      liquidationLogic.target
+    );
 
     // Deploy router
     const Router = await ethers.getContractFactory("CoFinanceRouter");
@@ -65,18 +83,7 @@ describe("CoFinanceRouter", function () {
     const receipt = await tx.wait();
     const event = receipt.logs.find((e) => e.eventName === "PoolCreated");
     pool = await ethers.getContractAt("CoFinancePool", event.args[0]);
-    liquidityToken = await ethers.getContractAt("MockLiquidityToken", event.args[3]);
-
-    // Create a lending pool
-    const lendingTx = await factory.connect(deployer).createLendingPool(
-      tokenA.target,
-      tokenB.target,
-      priceOracle.target,
-      liquidationLogic.target
-    );
-    const lendingReceipt = await lendingTx.wait();
-    const lendingEvent = lendingReceipt.logs.find((e) => e.eventName === "LendingPoolCreated");
-    lendingPool = await ethers.getContractAt("LendingPool", lendingEvent.args[0]);
+    liquidityToken = await ethers.getContractAt("LiquidityToken", event.args[3]);
 
     // Distribute tokens and approve
     await tokenA.transfer(user1.address, ethers.parseEther("10000"));
@@ -142,7 +149,6 @@ describe("CoFinanceRouter", function () {
   });
 
   it("should swap tokens", async function () {
-    // Add liquidity first
     await router.connect(user1).addLiquidity(
       tokenA.target,
       tokenB.target,
@@ -173,10 +179,18 @@ describe("CoFinanceRouter", function () {
   });
 
   it("should revert swap with invalid token", async function () {
+    const tokenC = await (await ethers.getContractFactory("GovernanceToken")).deploy(
+      "Token C",
+      "TKC",
+      ethers.parseEther("1000000")
+    );
+    await tokenC.waitForDeployment();
+
     await expect(
       router.connect(user1).swap(
         tokenA.target,
         tokenB.target,
+        tokenC.target,
         ethers.parseEther("10"),
         ethers.parseEther("5")
       )
@@ -206,7 +220,7 @@ describe("CoFinanceRouter", function () {
 
   it("should borrow with collateral", async function () {
     const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
+    const collateralAmount = ethers.parseEther("150"); // 150% collateral ratio
     const initialBalanceA = await tokenA.balanceOf(user1.address);
     const initialBalanceB = await tokenB.balanceOf(user1.address);
 
@@ -234,13 +248,13 @@ describe("CoFinanceRouter", function () {
     await tokenC.connect(user1).approve(router.target, ethers.parseEther("10000"));
 
     await expect(
-      router.connect(user1).borrow(tokenA.target, ethers.parseEther("100"), tokenC.target, ethers.parseEther("200"))
+      router.connect(user1).borrow(tokenA.target, ethers.parseEther("100"), tokenC.target, ethers.parseEther("150"))
     ).to.be.revertedWith("Lending pool does not exist");
   });
 
   it("should repay borrowed amount", async function () {
     const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
+    const collateralAmount = ethers.parseEther("150");
     await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
 
     await router.connect(user1).repay(tokenA.target, tokenB.target, borrowAmount);
@@ -253,7 +267,7 @@ describe("CoFinanceRouter", function () {
 
   it("should add collateral", async function () {
     const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
+    const collateralAmount = ethers.parseEther("150");
     const additionalCollateral = ethers.parseEther("50");
     await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
 
@@ -264,8 +278,8 @@ describe("CoFinanceRouter", function () {
 
   it("should withdraw collateral", async function () {
     const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
-    const withdrawAmount = ethers.parseEther("50");
+    const collateralAmount = ethers.parseEther("200"); // Extra collateral to allow withdrawal
+    const withdrawAmount = ethers.parseEther("25"); // Withdraw 25, leaving 175 (>150)
     await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
 
     const initialBalanceB = await tokenB.balanceOf(user1.address);
@@ -277,11 +291,11 @@ describe("CoFinanceRouter", function () {
 
   it("should revert withdraw with insufficient collateral", async function () {
     const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
+    const collateralAmount = ethers.parseEther("150");
     await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
 
     await expect(
-      router.connect(user1).withdrawCollateral(tokenA.target, tokenB.target, ethers.parseEther("300"))
-    ).to.be.revertedWith("Insufficient collateral");
+      router.connect(user1).withdrawCollateral(tokenA.target, tokenB.target, ethers.parseEther("100"))
+    ).to.be.revertedWith("Insufficient collateral after withdrawal");
   });
 });

@@ -8,17 +8,17 @@ describe("LendingPool", function () {
   beforeEach(async function () {
     [deployer, user, liquidator] = await ethers.getSigners();
 
-    const ERC20 = await ethers.getContractFactory("core/ERC20");
+    const ERC20 = await ethers.getContractFactory("GovernanceToken");
     token0 = await ERC20.deploy("Token A", "TKA", ethers.utils.parseEther("1000000"));
     token1 = await ERC20.deploy("Token B", "TKB", ethers.utils.parseEther("1000000"));
 
-    const CustomPriceOracle = await ethers.getContractFactory("oracle/CustomPriceOracle");
+    const CustomPriceOracle = await ethers.getContractFactory("CustomPriceOracle");
     priceOracle = await CustomPriceOracle.deploy(await token0.getAddress(), await token1.getAddress());
 
-    const LiquidityToken = await ethers.getContractFactory("core/LiquidityToken");
+    const LiquidityToken = await ethers.getContractFactory("LiquidityToken");
     liquidityToken = await LiquidityToken.deploy("Liquidity Token", "LPT");
 
-    const CoFinancePool = await ethers.getContractFactory("core/CoFinancePool");
+    const CoFinancePool = await ethers.getContractFactory("CoFinancePool");
     pool = await CoFinancePool.deploy(
       await token0.getAddress(),
       await token1.getAddress(),
@@ -28,10 +28,10 @@ describe("LendingPool", function () {
 
     await liquidityToken.setCoFinanceContract(await pool.getAddress());
 
-    const LiquidationLogic = await ethers.getContractFactory("lending/LiquidationLogic");
+    const LiquidationLogic = await ethers.getContractFactory("LiquidationLogic");
     liquidationLogic = await LiquidationLogic.deploy(await pool.getAddress(), await priceOracle.getAddress());
 
-    const LendingPool = await ethers.getContractFactory("lending/LendingPool");
+    const LendingPool = await ethers.getContractFactory("LendingPool");
     lendingPool = await LendingPool.deploy(
       await token0.getAddress(),
       await token1.getAddress(),
