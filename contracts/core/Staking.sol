@@ -1,64 +1,75 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "../oracle/CustomPriceOracle.sol";
 
-contract Staking {
-    using SafeERC20 for IERC20;
+contract Staking is Ownable {
+    IERC20 public stakingToken;
+    IERC20 public rewardToken;
+    CustomPriceOracle public priceOracle;
 
-    IERC20 public immutable stakingToken;
-    IERC20 public immutable rewardToken;
-    mapping(address => uint256) public stakedBalances;
-    mapping(address => uint256) public stakingDurations;
-    mapping(address => uint256) public stakingTimestamps;
+    uint256 public rewardRate = 1000; // Rewards per second (scaled by 1e18)
     uint256 public totalStaked;
+    mapping(address => uint256) public stakedBalance;
+    mapping(address => uint256) public rewards;
+    mapping(address => uint256) public lastUpdateTime;
 
-    event Staked(address indexed staker, uint256 amount, uint256 duration);
-    event Unstaked(address indexed staker, uint256 amount);
-    event RewardClaimed(address indexed staker, uint256 amount);
+    event Staked(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 amount);
 
-    constructor(address _stakingToken, address _rewardToken) {
+    constructor(
+        address _stakingToken,
+        address _rewardToken,
+        address _priceOracle
+    ) Ownable(msg.sender) {
         stakingToken = IERC20(_stakingToken);
         rewardToken = IERC20(_rewardToken);
+        priceOracle = CustomPriceOracle(_priceOracle);
     }
 
-    function stake(address staker, uint256 amount, uint256 duration) external {
-        require(amount > 0, "Amount must be > 0");
-        require(duration == 7 days || duration == 14 days || duration == 21 days, "Invalid duration");
+    function stake(uint256 amount) external {
+        require(amount > 0, "Invalid amount");
+        updateRewards(msg.sender);
 
-        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
-        stakedBalances[staker] += amount;
-        stakingDurations[staker] = duration;
-        stakingTimestamps[staker] = block.timestamp;
+        stakingToken.transferFrom(msg.sender, address(this), amount);
+        stakedBalance[msg.sender] += amount;
         totalStaked += amount;
 
-        emit Staked(staker, amount, duration);
+        emit Staked(msg.sender, amount);
     }
 
-    function unstake(address staker, uint256 amount) external {
-        require(amount > 0, "Amount must be > 0");
-        require(stakedBalances[staker] >= amount, "Insufficient balance");
+    function withdraw(uint256 amount) external {
+        require(amount > 0 && amount <= stakedBalance[msg.sender], "Invalid amount");
+        updateRewards(msg.sender);
 
-        stakedBalances[staker] -= amount;
+        stakedBalance[msg.sender] -= amount;
         totalStaked -= amount;
-        stakingToken.safeTransfer(staker, amount);
+        stakingToken.transfer(msg.sender, amount);
 
-        emit Unstaked(staker, amount);
+        emit Withdrawn(msg.sender, amount);
     }
 
-    function claimRewards(address staker) external {
-        uint256 reward = calculateReward(staker);
+    function claimRewards() external {
+        updateRewards(msg.sender);
+        uint256 reward = rewards[msg.sender];
         require(reward > 0, "No rewards");
-        rewardToken.safeTransfer(staker, reward);
-        stakingTimestamps[staker] = block.timestamp; 
-        emit RewardClaimed(staker, reward);
+
+        rewards[msg.sender] = 0;
+        rewardToken.transfer(msg.sender, reward);
+
+        emit RewardClaimed(msg.sender, reward);
     }
 
-    function calculateReward(address staker) public view returns (uint256) {
-        uint256 duration = block.timestamp - stakingTimestamps[staker];
-        uint256 rewardRate = stakingDurations[staker] == 7 days ? 20 :
-                            stakingDurations[staker] == 14 days ? 30 :
-                            stakingDurations[staker] == 21 days ? 50 : 0;
-        return stakedBalances[staker] * rewardRate * duration / 365 / 100;
+    function updateRewards(address user) internal {
+        uint256 timeDiff = block.timestamp - lastUpdateTime[user];
+        rewards[user] += stakedBalance[user] * timeDiff * rewardRate / 1e18;
+        lastUpdateTime[user] = block.timestamp;
+    }
+
+    function setRewardRate(uint256 _rewardRate) external onlyOwner {
+        rewardRate = _rewardRate;
     }
 }

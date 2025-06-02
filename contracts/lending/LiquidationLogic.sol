@@ -1,98 +1,87 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "../oracle/PriceOracle.sol";
-import "../lending/LendingPool.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "../oracle/CustomPriceOracle.sol";
+import "./LendingPool.sol";
 
-contract LiquidationLogic {
-    using SafeERC20 for IERC20;
-    using Math for uint256;
+contract LiquidationLogic is AccessControl {
+    bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
 
     LendingPool public immutable lendingPool;
-    PriceOracle public immutable priceOracle;
-    address public immutable owner;
+    CustomPriceOracle public immutable priceOracle;
 
-    uint256 public constant LIQUIDATION_BONUS = 5; // 5% bonus for liquidators
-    uint256 public constant MAX_LTV = 80; // 80% max LTV
+    uint256 public constant LIQUIDATION_THRESHOLD = 120; // 120% collateralization ratio
+    uint256 public constant LIQUIDATION_BONUS = 105; // 5% bonus for liquidator
+    uint256 public constant PRECISION = 100;
 
-    event Liquidated(
-        address indexed borrower,
+    event Liquidation(
+        address indexed user,
         address indexed liquidator,
-        uint256 collateralAmount0,
-        uint256 collateralAmount1,
-        uint256 debtCovered
+        address indexed debtToken,
+        uint256 debtAmount,
+        address collateralToken,
+        uint256 collateralAmount
     );
 
     constructor(address _lendingPool, address _priceOracle) {
         lendingPool = LendingPool(_lendingPool);
-        priceOracle = PriceOracle(_priceOracle);
-        owner = msg.sender;
+        priceOracle = CustomPriceOracle(_priceOracle);
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(LIQUIDATOR_ROLE, msg.sender);
     }
 
-    function isLiquidatable(address borrower) public view returns (bool) {
-        uint256 borrowedAmount = lendingPool.borrowed(borrower);
-        if (borrowedAmount == 0) return false;
-
-        (uint256 collateral0, uint256 collateral1) = (
-            lendingPool.collateral0(borrower),
-            lendingPool.collateral1(borrower)
-        );
-        uint256 price = priceOracle.getPrice(address(lendingPool.token0()), address(lendingPool.token1()));
-        uint256 collateralValue = collateral0 + (collateral1 * price) / 1e18;
-        uint256 maxLoanValue = collateralValue * MAX_LTV / 100;
-
-        return borrowedAmount > maxLoanValue;
+    function isLiquidatable(address user) external view returns (bool) {
+        (uint256 borrowedValue, uint256 collateralValue) = getPositionValues(user);
+        if (borrowedValue == 0 || collateralValue == 0) {
+            return false;
+        }
+        return collateralValue * PRECISION < borrowedValue * LIQUIDATION_THRESHOLD;
     }
 
-    function liquidate(address borrower, address liquidator) external {
-        require(isLiquidatable(borrower), "Loan not liquidatable");
-        require(liquidator != borrower, "Cannot liquidate own loan");
+    function liquidate(address user, address liquidator) external onlyRole(LIQUIDATOR_ROLE) {
+        require(user != address(0) && liquidator != address(0), "Invalid addresses");
 
-        uint256 borrowedAmount = lendingPool.borrowed(borrower);
-        (uint256 collateral0, uint256 collateral1) = (
-            lendingPool.collateral0(borrower),
-            lendingPool.collateral1(borrower)
+        (uint256 borrowedValue, uint256 collateralValue) = getPositionValues(user);
+        require(borrowedValue > 0 && collateralValue > 0, "No position to liquidate");
+        require(
+            collateralValue * PRECISION < borrowedValue * LIQUIDATION_THRESHOLD,
+            "Position not liquidatable"
         );
 
-        uint256 debtToCover = borrowedAmount;
-        uint256 collateralValueInToken0 = collateral0 + (collateral1 * priceOracle.getPrice(address(lendingPool.token0()), address(lendingPool.token1()))) / 1e18;
-        uint256 collateralToLiquidate = debtToCover * (100 + LIQUIDATION_BONUS) / MAX_LTV;
+        address debtToken = borrowedValue > 0 ? address(lendingPool.token0()) : address(lendingPool.token1());
+        address collateralToken = collateralValue > 0 ? address(lendingPool.token1()) : address(lendingPool.token0());
+        uint256 debtAmount = lendingPool.borrowed(user);
+        uint256 collateralAmount = lendingPool.collateral(user);
+        uint256 debtValueInCollateral = (debtAmount * priceOracle.getPrice(debtToken)) / priceOracle.getPrice(collateralToken);
+        uint256 collateralToLiquidator = (debtValueInCollateral * LIQUIDATION_BONUS) / PRECISION;
 
-        require(collateralValueInToken0 >= collateralToLiquidate, "Insufficient collateral");
-
-        if (collateral0 > 0) {
-            lendingPool.token0().safeTransfer(liquidator, collateral0);
-            lendingPool.updateCollateral0(borrower, 0);
-        }
-        if (collateral1 > 0) {
-            lendingPool.token1().safeTransfer(liquidator, collateral1);
-            lendingPool.updateCollateral1(borrower, 0);
-        }
-        lendingPool.updateBorrowed(borrower, 0);
-
-        emit Liquidated(borrower, liquidator, collateral0, collateral1, debtToCover);
+        require(collateralToLiquidator <= collateralAmount, "Insufficient collateral");
+        IERC20(debtToken).transferFrom(liquidator, address(lendingPool), debtAmount);
+        IERC20(collateralToken).transferFrom(address(lendingPool), liquidator, collateralToLiquidator);
+        lendingPool.liquidatePosition(user, debtAmount, collateralToLiquidator);
+        emit Liquidation(user, liquidator, debtToken, debtAmount, collateralToken, collateralToLiquidator);
     }
 
-    function seizeCollateral(address borrower) external {
-        require(msg.sender == owner, "Only owner");
-        require(isLiquidatable(borrower), "Loan not liquidatable");
+    function getPositionValues(address user) public view returns (uint256 borrowedValue, uint256 collateralValue) {
+        uint256 borrowedAmount = lendingPool.borrowed(user);
+        uint256 collateralAmount = lendingPool.collateral(user);
 
-        uint256 collateral0 = lendingPool.collateral0(borrower);
-        uint256 collateral1 = lendingPool.collateral1(borrower);
-
-        if (collateral0 > 0) {
-            lendingPool.token0().safeTransfer(owner, collateral0);
-            lendingPool.updateCollateral0(borrower, 0);
-        }
-        if (collateral1 > 0) {
-            lendingPool.token1().safeTransfer(owner, collateral1);
-            lendingPool.updateCollateral1(borrower, 0);
+        if (borrowedAmount > 0) {
+            borrowedValue = (borrowedAmount * priceOracle.getPrice(address(lendingPool.token0()))) / 1e18;
         }
 
-        lendingPool.updateBorrowed(borrower, 0);
+        if (collateralAmount > 0) {
+            collateralValue = (collateralAmount * priceOracle.getPrice(address(lendingPool.token1()))) / 1e18;
+        }
+    }
 
-        emit Liquidated(borrower, owner, collateral0, collateral1, lendingPool.borrowed(borrower));
+    function updateLiquidatorRole(address account, bool grant) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (grant) {
+            _grantRole(LIQUIDATOR_ROLE, account);
+        } else {
+            _revokeRole(LIQUIDATOR_ROLE, account);
+        }
     }
 }

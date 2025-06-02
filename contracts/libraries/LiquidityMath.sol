@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./TickMath.sol";
@@ -13,85 +13,44 @@ library LiquidityMath {
         uint160 sqrtPriceX96,
         int24 tickLower,
         int24 tickUpper
-    ) internal pure returns (uint128 liquidity) {
-        require(amount0 > 0 || amount1 > 0, "Invalid amounts");
+    ) external view returns (uint256 liquidity) {
         require(tickLower < tickUpper, "Invalid tick range");
-        require(tickLower >= TickMath.MIN_TICK && tickUpper <= TickMath.MAX_TICK, "Ticks out of bounds");
 
-        uint160 sqrtPriceLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtPriceUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
-        uint160 sqrtPriceCurrentX96 = sqrtPriceX96;
+        // Get sqrt price ratios at ticks
+        uint256 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower); // Returns 1 << 96
+        uint256 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper); // Returns 1 << 96
 
-        if (sqrtPriceCurrentX96 < sqrtPriceLowerX96) {
-            sqrtPriceCurrentX96 = sqrtPriceLowerX96;
-        } else if (sqrtPriceCurrentX96 > sqrtPriceUpperX96) {
-            sqrtPriceCurrentX96 = sqrtPriceUpperX96;
+        // Ensure sqrtRatioAX96 <= sqrtRatioBX96
+        if (sqrtRatioAX96 > sqrtRatioBX96) {
+            (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
         }
-        if (sqrtPriceCurrentX96 <= sqrtPriceLowerX96) {
-            liquidity = uint128(
-                (amount0 * (sqrtPriceUpperX96 * sqrtPriceLowerX96) / 2**96) / (sqrtPriceUpperX96 - sqrtPriceLowerX96)
-            );
-        } else if (sqrtPriceCurrentX96 < sqrtPriceUpperX96) {
-            uint128 liquidity0 = uint128(
-                (amount0 * (sqrtPriceUpperX96 * sqrtPriceCurrentX96) / 2**96) / (sqrtPriceUpperX96 - sqrtPriceCurrentX96)
-            );
-            uint128 liquidity1 = uint128(
-                (amount1 * 2**96) / (sqrtPriceCurrentX96 - sqrtPriceLowerX96)
-            );
-            liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+
+        // Normalize to prevent overflow
+        uint256 priceProduct = (sqrtRatioBX96 * sqrtRatioAX96) >> 96; // (1 << 96 * 1 << 96) >> 96 = 1 << 96
+        uint256 denominator;
+
+        if (sqrtPriceX96 <= sqrtRatioAX96) {
+            // Current price below range: use amount0
+            denominator = sqrtRatioBX96 - sqrtRatioAX96;
+            if (denominator == 0) {
+                liquidity = amount0; // Fallback to amount0 if ticks are equal
+            } else {
+                liquidity = (amount0 * priceProduct) / denominator;
+            }
+        } else if (sqrtPriceX96 < sqrtRatioBX96) {
+            // Current price in range: use amount1
+            denominator = sqrtRatioBX96 - sqrtPriceX96;
+            liquidity = (amount1 * priceProduct) / denominator;
         } else {
-            liquidity = uint128(
-                (amount1 * 2**96) / (sqrtPriceUpperX96 - sqrtPriceLowerX96)
-            );
+            // Current price above range: use amount1
+            denominator = sqrtPriceX96 - sqrtRatioAX96;
+            if (denominator == 0) {
+                liquidity = amount1; // Fallback to amount1 if ticks are equal
+            } else {
+                liquidity = (amount1 * priceProduct) / denominator;
+            }
         }
 
-        require(liquidity > 0, "Zero liquidity");
         return liquidity;
-    }
-
-    function calculateAmount0(
-        uint128 liquidity,
-        int24 tickLower,
-        int24 tickUpper,
-        uint160 sqrtPriceX96
-    ) internal pure returns (uint256 amount0) {
-        require(liquidity > 0, "Zero liquidity");
-        require(tickLower < tickUpper, "Invalid tick range");
-
-        uint160 sqrtPriceLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtPriceUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
-
-        if (sqrtPriceX96 <= sqrtPriceLowerX96) {
-            amount0 = (liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96) * 2**96) / (sqrtPriceUpperX96 * sqrtPriceLowerX96);
-        } else if (sqrtPriceX96 < sqrtPriceUpperX96) {
-            amount0 = (liquidity * (sqrtPriceUpperX96 - sqrtPriceX96) * 2**96) / (sqrtPriceUpperX96 * sqrtPriceX96);
-        } else {
-            amount0 = 0;
-        }
-
-        return amount0;
-    }
-
-    function calculateAmount1(
-        uint128 liquidity,
-        int24 tickLower,
-        int24 tickUpper,
-        uint160 sqrtPriceX96
-    ) internal pure returns (uint256 amount1) {
-        require(liquidity > 0, "Zero liquidity");
-        require(tickLower < tickUpper, "Invalid tick range");
-
-        uint160 sqrtPriceLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtPriceUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
-
-        if (sqrtPriceX96 <= sqrtPriceLowerX96) {
-            amount1 = 0;
-        } else if (sqrtPriceX96 < sqrtPriceUpperX96) {
-            amount1 = liquidity * (sqrtPriceX96 - sqrtPriceLowerX96) / 2**96;
-        } else {
-            amount1 = liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96) / 2**96;
-        }
-
-        return amount1;
     }
 }
