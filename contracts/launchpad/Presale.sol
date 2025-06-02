@@ -10,7 +10,7 @@ contract Launchpad is Ownable {
 
     IERC20 public immutable saleToken;
     IERC20 public immutable paymentToken;
-    uint256 public immutable tokenPrice; // Payment tokens per sale token (scaled by 1e18)
+    uint256 public immutable tokenPrice;
     uint256 public immutable totalTokensForSale;
     uint256 public immutable minPurchase;
     uint256 public immutable maxPurchase;
@@ -89,7 +89,6 @@ contract Launchpad is Ownable {
 
     function withdrawUnsoldTokens() external onlyOwner {
         require(finalized, "Sale not finalized");
-        // Calculate unsold tokens: totalTokensForSale - tokens sold
         uint256 tokensSold = totalRaised * 1e18 / tokenPrice;
         uint256 unsold = totalTokensForSale > tokensSold ? totalTokensForSale - tokensSold : 0;
         if (unsold > 0) {
