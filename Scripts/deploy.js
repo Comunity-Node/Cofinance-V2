@@ -4,7 +4,6 @@ async function main() {
   const [deployer] = await hre.ethers.getSigners();
   console.log("Deploying from account:", deployer.address);
 
-  // Deploy ERC20 tokens
   const ERC20 = await hre.ethers.getContractFactory("ERC20");
   const token0 = await ERC20.deploy("Token A", "TKA", hre.ethers.utils.parseEther("1000000"));
   await token0.waitForDeployment();
@@ -14,19 +13,16 @@ async function main() {
   await token1.waitForDeployment();
   console.log("Token1 deployed at:", await token1.getAddress());
 
-  // Deploy LiquidityToken
   const LiquidityToken = await hre.ethers.getContractFactory("LiquidityToken");
   const liquidityToken = await LiquidityToken.deploy("Liquidity Token", "LPT");
   await liquidityToken.waitForDeployment();
   console.log("LiquidityToken deployed at:", await liquidityToken.getAddress());
 
-  // Deploy PriceOracle
   const PriceOracle = await hre.ethers.getContractFactory("PriceOracle");
   const priceOracle = await PriceOracle.deploy(await token0.getAddress(), 3600);
   await priceOracle.waitForDeployment();
   console.log("PriceOracle deployed at:", await priceOracle.getAddress());
 
-  // Deploy CoFinancePool
   const CoFinancePool = await hre.ethers.getContractFactory("CoFinancePool");
   const pool = await CoFinancePool.deploy(
     await token0.getAddress(),

@@ -1,35 +1,25 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract LiquidityToken is ERC20 {
-    using SafeERC20 for IERC20;
+contract LiquidityToken is ERC20, Ownable {
+    address public coFinanceContract;
 
-    address public immutable owner;
-    address public cofinanceContract;
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) Ownable(msg.sender) {}
 
     modifier onlyCoFinance() {
-        require(msg.sender == cofinanceContract, "Only CoFinance contract");
+        require(msg.sender == coFinanceContract, "Only CoFinance contract");
         _;
     }
 
-    constructor(string memory name, string memory symbol) ERC20(name, symbol) {
-        owner = msg.sender;
+    function setCoFinanceContract(address _coFinanceContract) external onlyOwner {
+        require(_coFinanceContract != address(0), "Invalid address");
+        coFinanceContract = _coFinanceContract;
     }
 
-    function mint(address account, uint256 amount) external onlyCoFinance {
-        _mint(account, amount);
-    }
-
-    function burn(address account, uint256 amount) external onlyCoFinance {
-        _burn(account, amount);
-    }
-
-    function setCoFinanceContract(address _cofinanceContract) external {
-        require(msg.sender == owner, "Only owner");
-        require(_cofinanceContract != address(0), "Invalid address");
-        cofinanceContract = _cofinanceContract;
+    function mint(address to, uint256 amount) external onlyCoFinance {
+        _mint(to, amount);
     }
 }

@@ -1,117 +1,121 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "../libraries/TickMath.sol";
 import "../libraries/LiquidityMath.sol";
 import "../libraries/SwapMath.sol";
-import "./LiquidityToken.sol";
-import "../oracle/PriceOracle.sol";
+import "../oracle/CustomPriceOracle.sol";
 
-contract CoFinancePool {
-    using SafeERC20 for IERC20;
-    using Math for uint256;
+interface ILiquidityToken is IERC20 {
+    function mint(address to, uint256 amount) external;
+}
+
+contract CoFinancePool is AccessControl {
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
     IERC20 public immutable token0;
     IERC20 public immutable token1;
-    LiquidityToken public immutable liquidityToken;
-    PriceOracle public immutable priceOracle;
-    address public immutable owner;
+    ILiquidityToken public immutable liquidityToken;
+    CustomPriceOracle public immutable priceOracle;
 
-    struct Position {
-        uint128 liquidity;
-        int24 tickLower;
-        int24 tickUpper;
-        uint256 feeGrowth0;
-        uint256 feeGrowth1;
-    }
+    mapping(address => uint256) public liquidity;
 
-    mapping(bytes32 => Position) public positions;
-    uint256 public swapFeePercent = 30; // 0.3% default fee
-    uint256 public totalLiquidity;
-    uint160 public currentSqrtPriceX96;
+    event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint256 liquidity);
+    event Swap(address indexed user, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
 
-    event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out);
-    event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint128 liquidity);
-    event FeesUpdated(uint256 newFeePercent);
+    constructor(
+        address _token0,
+        address _token1,
+        address _liquidityToken,
+        address _priceOracle
+    ) {
+        require(_token0 != address(0) && _token1 != address(0), "Invalid token addresses");
+        require(_liquidityToken != address(0), "Invalid liquidity token address");
+        require(_priceOracle != address(0), "Invalid price oracle address");
 
-    constructor(address _token0, address _token1, address _liquidityToken, address _priceOracle) {
-        require(_token0 < _token1, "Invalid token order");
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
-        liquidityToken = LiquidityToken(_liquidityToken);
-        priceOracle = PriceOracle(_priceOracle);
-        owner = msg.sender;
-        currentSqrtPriceX96 = 79228162514264337593543950336; 
+        liquidityToken = ILiquidityToken(_liquidityToken);
+        priceOracle = CustomPriceOracle(_priceOracle);
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MANAGER_ROLE, msg.sender);
     }
 
-    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut, address recipient) external returns (uint256 amountOut) {
-        require(amountIn > 0, "Amount must be > 0");
-        bool isToken0 = tokenIn == address(token0);
-        (IERC20 tokenInContract, IERC20 tokenOutContract) = isToken0 ? (token0, token1) : (token1, token0);
-        amountOut = SwapMath.calculateSwapOutput(amountIn, currentSqrtPriceX96, swapFeePercent);
-        require(amountOut >= minAmountOut, "Insufficient output amount");
-
-        tokenInContract.safeTransferFrom(msg.sender, address(this), amountIn);
-        tokenOutContract.safeTransfer(recipient, amountOut);
-
-        uint256 feeAmount = SwapMath.calculateFee(amountIn, swapFeePercent);
-        bytes32 positionKey = keccak256(abi.encodePacked(msg.sender, TickMath.MIN_TICK, TickMath.MAX_TICK));
-        if (isToken0) {
-            positions[positionKey].feeGrowth0 += feeAmount;
-        } else {
-            positions[positionKey].feeGrowth1 += feeAmount;
-        }
-        currentSqrtPriceX96 = priceOracle.getPrice(address(token0), address(token1));
-
-        emit Swap(msg.sender, isToken0 ? amountIn : 0, isToken0 ? 0 : amountIn, isToken0 ? 0 : amountOut, isToken0 ? amountOut : 0);
-    }
-
-    function addLiquidity(uint256 amount0, uint256 amount1, int24 tickLower, int24 tickUpper) external returns (uint128 liquidity) {
+    function addLiquidity(
+        uint256 amount0,
+        uint256 amount1,
+        int24 tickLower,
+        int24 tickUpper
+    ) external {
         require(amount0 > 0 && amount1 > 0, "Invalid amounts");
-        require(tickLower < tickUpper, "Invalid tick range");
+        require(tickLower < tickUpper, "Invalid ticks");
+        require(tickLower >= TickMath.MIN_TICK && tickUpper <= TickMath.MAX_TICK, "Ticks out of range");
 
-        liquidity = LiquidityMath.calculateLiquidity(amount0, amount1, currentSqrtPriceX96, tickLower, tickUpper);
+        token0.transferFrom(msg.sender, address(this), amount0);
+        token1.transferFrom(msg.sender, address(this), amount1);
+        (uint256 price0, uint256 price1) = priceOracle.getPricePair();
+        uint160 sqrtPriceX96;
+        if (address(token0) < address(token1)) {
+            sqrtPriceX96 = encodeSqrtPriceX96FromPrices(price0, price1);
+        } else {
+            sqrtPriceX96 = encodeSqrtPriceX96FromPrices(price1, price0);
+        }
 
-        token0.safeTransferFrom(msg.sender, address(this), amount0);
-        token1.safeTransferFrom(msg.sender, address(this), amount1);
-        liquidityToken.mint(msg.sender, liquidity);
+        uint256 liquidityAmount = LiquidityMath.calculateLiquidity(
+            amount0,
+            amount1,
+            sqrtPriceX96,
+            tickLower,
+            tickUpper
+        );
 
-        bytes32 positionKey = keccak256(abi.encodePacked(msg.sender, tickLower, tickUpper));
-        positions[positionKey].liquidity += liquidity;
-        positions[positionKey].tickLower = tickLower;
-        positions[positionKey].tickUpper = tickUpper;
-        totalLiquidity += liquidity;
+        liquidityToken.mint(msg.sender, liquidityAmount);
+        liquidity[msg.sender] += liquidityAmount;
 
-        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
+        emit LiquidityAdded(msg.sender, amount0, amount1, liquidityAmount);
     }
 
-    function removeLiquidity(uint128 liquidity, int24 tickLower, int24 tickUpper) external {
-        bytes32 positionKey = keccak256(abi.encodePacked(msg.sender, tickLower, tickUpper));
-        Position memory position = positions[positionKey];
-        require(position.liquidity >= liquidity, "Insufficient liquidity");
+    function swap(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address recipient
+    ) external returns (uint256 amountOut) {
+        require(amountIn > 0, "Invalid amount");
+        require(tokenIn == address(token0) || tokenIn == address(token1), "Invalid token");
+        require(recipient != address(0), "Invalid recipient");
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        (uint256 price0, uint256 price1) = priceOracle.getPricePair();
+        uint160 sqrtPriceInX96;
+        uint160 sqrtPriceOutX96;
+        if (tokenIn == address(token0)) {
+            sqrtPriceInX96 = encodeSqrtPriceX96FromPrices(price0, price1);
+            sqrtPriceOutX96 = encodeSqrtPriceX96FromPrices(price1, price0);
+        } else {
+            sqrtPriceInX96 = encodeSqrtPriceX96FromPrices(price1, price0);
+            sqrtPriceOutX96 = encodeSqrtPriceX96FromPrices(price0, price1);
+        }
+        amountOut = SwapMath.calculateSwapOutput(
+            amountIn,
+            sqrtPriceInX96,
+            sqrtPriceOutX96
+        );
 
-        uint256 amount0 = LiquidityMath.calculateAmount0(liquidity, tickLower, tickUpper, currentSqrtPriceX96);
-        uint256 amount1 = LiquidityMath.calculateAmount1(liquidity, tickLower, tickUpper, currentSqrtPriceX96);
-
-        positions[positionKey].liquidity -= liquidity;
-        totalLiquidity -= liquidity;
-        liquidityToken.burn(msg.sender, liquidity);
-
-        token0.safeTransfer(msg.sender, amount0);
-        token1.safeTransfer(msg.sender, amount1);
+        require(amountOut >= amountOutMin, "Insufficient output amount");
+        IERC20(tokenIn == address(token0) ? address(token1) : address(token0)).transfer(recipient, amountOut);
+        emit Swap(msg.sender, tokenIn, amountIn, amountOut);
+        return amountOut;
     }
 
-    function setSwapFee(uint256 newFeePercent) external {
-        require(msg.sender == owner, "Only owner");
-        require(newFeePercent <= 1000, "Fee too high");
-        swapFeePercent = newFeePercent;
-        emit FeesUpdated(newFeePercent);
-    }
-
-    function updateSqrtPrice(uint160 newSqrtPriceX96) external {
-        require(msg.sender == owner, "Only owner");
-        currentSqrtPriceX96 = newSqrtPriceX96;
+    /// @dev Converts price ratio to sqrtPriceX96 used for Uniswap-style liquidity math
+    function encodeSqrtPriceX96FromPrices(uint256 priceIn, uint256 priceOut) internal pure returns (uint160) {
+        require(priceIn > 0 && priceOut > 0, "Invalid prices");
+        uint256 ratioX192 = (priceOut << 192) / priceIn;
+        uint256 sqrtRatioX96 = Math.sqrt(ratioX192);
+        require(sqrtRatioX96 <= type(uint160).max, "sqrt ratio overflow");
+        return uint160(sqrtRatioX96);
     }
 }
