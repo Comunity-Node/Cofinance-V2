@@ -32,10 +32,9 @@ contract CoFinanceRouter {
         require(poolAddr != address(0), "Pool does not exist");
         IERC20(tokenA).transferFrom(msg.sender, poolAddr, amountA);
         IERC20(tokenB).transferFrom(msg.sender, poolAddr, amountB);
-        CoFinancePool(poolAddr).addLiquidity(amountA, amountB, tickLower, tickUpper);
+        CoFinancePool(poolAddr).addLiquidity(msg.sender, amountA, amountB, tickLower, tickUpper);
     }
 
-    // Swap tokens
     function swap(
         address tokenA,
         address tokenB,
@@ -47,9 +46,10 @@ contract CoFinanceRouter {
         require(poolAddr != address(0), "Pool does not exist");
         require(tokenIn == tokenA || tokenIn == tokenB, "Invalid input token");
         IERC20(tokenIn).transferFrom(msg.sender, poolAddr, amountIn);
-        uint256 amountOut = CoFinancePool(poolAddr).swap(tokenIn, amountIn, minAmountOut, msg.sender);
+        uint256 amountOut = CoFinancePool(poolAddr).swap(msg.sender, tokenIn, amountIn, minAmountOut, msg.sender);
         require(amountOut >= minAmountOut, "Insufficient output amount");
     }
+
 
 
     // Borrow with collateral deposit

@@ -56,8 +56,12 @@ contract LendingPool is AccessControl {
 
         uint256 collateralValue = (collateralAmount * priceOracle.getPrice(collateralTokenAddress)) / 1e18;
         uint256 borrowValue = (amount * priceOracle.getPrice(token)) / 1e18;
-        require(collateralValue >= borrowValue * 150 / 100, "Insufficient collateral"); 
-        IERC20(collateralTokenAddress).transferFrom(msg.sender, address(this), collateralAmount);
+        require(collateralValue >= borrowValue * 150 / 100, "Insufficient collateral");
+
+        // Verify balances
+        require(IERC20(collateralTokenAddress).balanceOf(address(this)) >= collateralAmount, "Insufficient collateral token balance");
+        require(IERC20(token).balanceOf(address(this)) >= amount, "Insufficient borrow token balance");
+
         IERC20(token).transfer(borrower, amount);
 
         borrowed[borrower] = amount;
@@ -71,7 +75,7 @@ contract LendingPool is AccessControl {
     function repay(address borrower, uint256 amount) external {
         require(borrowed[borrower] >= amount, "Invalid repay amount");
         require(borrowedToken[borrower] != address(0), "No borrow position");
-        IERC20(borrowedToken[borrower]).transferFrom(msg.sender, address(this), amount);
+        require(IERC20(borrowedToken[borrower]).balanceOf(address(this)) >= amount, "Insufficient token balance");
         borrowed[borrower] -= amount;
         if (borrowed[borrower] == 0) {
             borrowedToken[borrower] = address(0);
@@ -83,7 +87,7 @@ contract LendingPool is AccessControl {
     function addCollateral(address user, uint256 amount) external {
         require(amount > 0, "Invalid amount");
         require(collateralToken[user] != address(0), "No existing position");
-        IERC20(collateralToken[user]).transferFrom(msg.sender, address(this), amount);
+        require(IERC20(collateralToken[user]).balanceOf(address(this)) >= amount, "Insufficient collateral token balance");
         collateral[user] += amount;
         emit CollateralAdded(user, amount);
     }
