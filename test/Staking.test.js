@@ -8,14 +8,14 @@ describe("Staking", function () {
   beforeEach(async function () {
     [deployer, user1, user2] = await ethers.getSigners();
 
-    const ERC20 = await ethers.getContractFactory("core/ERC20");
-    stakingToken = await ERC20.deploy("Staking Token", "STK", ethers.utils.parseEther("1000000"));
-    rewardToken = await ERC20.deploy("Reward Token", "RWD", ethers.utils.parseEther("1000000"));
+    const ERC20 = await ethers.getContractFactory("GovernanceToken");
+    stakingToken = await ERC20.deploy("Staking Token", "STK", ethers.parseEther("1000000"));
+    rewardToken = await ERC20.deploy("Reward Token", "RWD", ethers.parseEther("1000000"));
 
-    const CustomPriceOracle = await ethers.getContractFactory("oracle/CustomPriceOracle");
+    const CustomPriceOracle = await ethers.getContractFactory("CustomPriceOracle");
     priceOracle = await CustomPriceOracle.deploy(await stakingToken.getAddress(), await rewardToken.getAddress());
 
-    const Staking = await ethers.getContractFactory("staking/Staking");
+    const Staking = await ethers.getContractFactory("Staking");
     staking = await Staking.deploy(
       await stakingToken.getAddress(),
       await rewardToken.getAddress(),
@@ -23,21 +23,21 @@ describe("Staking", function () {
     );
 
     // Fund users and staking contract
-    await stakingToken.transfer(user1.address, ethers.utils.parseEther("1000"));
-    await stakingToken.transfer(user2.address, ethers.utils.parseEther("1000"));
-    await rewardToken.transfer(await staking.getAddress(), ethers.utils.parseEther("10000"));
+    await stakingToken.transfer(user1.address, ethers.parseEther("1000"));
+    await stakingToken.transfer(user2.address, ethers.parseEther("1000"));
+    await rewardToken.transfer(await staking.getAddress(), ethers.parseEther("10000"));
   });
 
   describe("Stake", function () {
     it("should stake tokens successfully", async function () {
-      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.utils.parseEther("100"));
-      await expect(staking.connect(user1).stake(ethers.utils.parseEther("100")))
+      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.parseEther("100"));
+      await expect(staking.connect(user1).stake(ethers.parseEther("100")))
         .to.emit(staking, "Staked")
-        .withArgs(user1.address, ethers.utils.parseEther("100"));
+        .withArgs(user1.address, ethers.parseEther("100"));
 
-      expect(await staking.stakedBalance(user1.address)).to.equal(ethers.utils.parseEther("100"));
-      expect(await staking.totalStaked()).to.equal(ethers.utils.parseEther("100"));
-      expect(await stakingToken.balanceOf(user1.address)).to.equal(ethers.utils.parseEther("900"));
+      expect(await staking.stakedBalance(user1.address)).to.equal(ethers.parseEther("100"));
+      expect(await staking.totalStaked()).to.equal(ethers.parseEther("100"));
+      expect(await stakingToken.balanceOf(user1.address)).to.equal(ethers.parseEther("900"));
     });
 
     it("should revert with zero stake", async function () {
@@ -47,29 +47,29 @@ describe("Staking", function () {
 
   describe("Withdraw", function () {
     beforeEach(async function () {
-      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.utils.parseEther("100"));
-      await staking.connect(user1).stake(ethers.utils.parseEther("100"));
+      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.parseEther("100"));
+      await staking.connect(user1).stake(ethers.parseEther("100"));
     });
 
     it("should withdraw staked tokens", async function () {
-      await expect(staking.connect(user1).withdraw(ethers.utils.parseEther("50")))
+      await expect(staking.connect(user1).withdraw(ethers.parseEther("50")))
         .to.emit(staking, "Withdrawn")
-        .withArgs(user1.address, ethers.utils.parseEther("50"));
+        .withArgs(user1.address, ethers.parseEther("50"));
 
-      expect(await staking.stakedBalance(user1.address)).to.equal(ethers.utils.parseEther("50"));
-      expect(await staking.totalStaked()).to.equal(ethers.utils.parseEther("50"));
-      expect(await stakingToken.balanceOf(user1.address)).to.equal(ethers.utils.parseEther("950"));
+      expect(await staking.stakedBalance(user1.address)).to.equal(ethers.parseEther("50"));
+      expect(await staking.totalStaked()).to.equal(ethers.parseEther("50"));
+      expect(await stakingToken.balanceOf(user1.address)).to.equal(ethers.parseEther("950"));
     });
 
     it("should revert with excessive withdraw", async function () {
-      await expect(staking.connect(user1).withdraw(ethers.utils.parseEther("101"))).to.be.revertedWith("Invalid amount");
+      await expect(staking.connect(user1).withdraw(ethers.parseEther("101"))).to.be.revertedWith("Invalid amount");
     });
   });
 
   describe("Claim Rewards", function () {
     beforeEach(async function () {
-      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.utils.parseEther("100"));
-      await staking.connect(user1).stake(ethers.utils.parseEther("100"));
+      await stakingToken.connect(user1).approve(await staking.getAddress(), ethers.parseEther("100"));
+      await staking.connect(user1).stake(ethers.parseEther("100"));
     });
 
     it("should claim rewards after time", async function () {
@@ -78,9 +78,9 @@ describe("Staking", function () {
 
       await expect(staking.connect(user1).claimRewards())
         .to.emit(staking, "RewardClaimed")
-        .withArgs(user1.address, ethers.utils.parseEther("3600")); // 100 * 3600 * 1000 / 1e18
+        .withArgs(user1.address, ethers.parseEther("3600")); // 100 * 3600 * 1000 / 1e18
 
-      expect(await rewardToken.balanceOf(user1.address)).to.equal(ethers.utils.parseEther("3600"));
+      expect(await rewardToken.balanceOf(user1.address)).to.equal(ethers.parseEther("3600"));
       expect(await staking.rewards(user1.address)).to.equal(0);
     });
 
