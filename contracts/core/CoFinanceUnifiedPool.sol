@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: MIT
-
-
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "../libraries/TickMath.sol";
-import "../libraries/LiquidityMath.sol";
-import "../libraries/SwapMath.sol";
-import "../oracle/CustomPriceOracle.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "./LiquidationLogic.sol";
 import "./RewardManager.sol";
 import "./LiquidityManager.sol";
-
+import "../libraries/TickMath.sol";
+import "../libraries/LiquidityMath.sol";
+import "../libraries/SwapMath.sol";
+import "../interface/ILiquidityToken.sol";
 
 contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     using Math for uint256;
@@ -24,10 +22,12 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     IERC20 public immutable token0;
     IERC20 public immutable token1;
     ILiquidityToken public immutable liquidityToken;
-    CustomPriceOracle public immutable priceOracle;
+    AggregatorV3Interface public immutable priceFeed0;
+    AggregatorV3Interface public immutable priceFeed1;
     LiquidationLogic public immutable liquidationLogic;
     RewardManager public immutable rewardManager;
     LiquidityManager public immutable liquidityManager;
+    address public immutable router;
 
     mapping(address => uint256) public liquidity;
     mapping(address => uint256) public borrowed;
@@ -40,8 +40,8 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     mapping(address => uint256) public stakedBalance;
     uint256 public totalStaked;
     mapping(address => uint256) public lastUpdateTime;
-    uint256 public swapFee = 300;
-    uint256 public annualInterestRate = 500;
+    uint256 public swapFee = 300; // 0.3%
+    uint256 public annualInterestRate = 500; // 5%
     mapping(address => uint256) public borrowStartTime;
     mapping(address => bool) public allowedLendingTokens;
     mapping(address => bool) public allowedCollateralTokens;
@@ -62,25 +62,30 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         address _token0,
         address _token1,
         address _liquidityToken,
-        address _priceOracle,
+        address _priceFeed0,
+        address _priceFeed1,
         address _liquidationLogic,
         address _rewardManager,
-        address _liquidityManager
+        address _liquidityManager,
+        address _router
     ) {
         require(_token0 != address(0) && _token1 != address(0), "Invalid token addresses");
         require(_liquidityToken != address(0), "Invalid liquidity token");
-        require(_priceOracle != address(0), "Invalid price oracle");
+        require(_priceFeed0 != address(0) && _priceFeed1 != address(0), "Invalid price feeds");
         require(_liquidationLogic != address(0), "Invalid liquidation logic");
         require(_rewardManager != address(0), "Invalid reward manager");
         require(_liquidityManager != address(0), "Invalid liquidity manager");
+        require(_router != address(0), "Invalid router");
 
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
         liquidityToken = ILiquidityToken(_liquidityToken);
-        priceOracle = CustomPriceOracle(_priceOracle);
+        priceFeed0 = AggregatorV3Interface(_priceFeed0);
+        priceFeed1 = AggregatorV3Interface(_priceFeed1);
         liquidationLogic = LiquidationLogic(_liquidationLogic);
         rewardManager = RewardManager(_rewardManager);
         liquidityManager = LiquidityManager(_liquidityManager);
+        router = _router;
         allowedLendingTokens[_token0] = true;
         allowedLendingTokens[_token1] = true;
         allowedCollateralTokens[_token0] = true;
@@ -89,9 +94,22 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         _grantRole(MANAGER_ROLE, msg.sender);
     }
 
+    function getPrice(address token) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = token == address(token0) ? priceFeed0 : priceFeed1;
+        (, int256 price,, uint256 timeStamp,) = priceFeed.latestRoundData();
+        require(price > 0, "Invalid price");
+        require(block.timestamp <= timeStamp + 3600, "Stale price data"); // 1-hour staleness check
+        return uint256(price) * 1e10; // Adjust to 18 decimals (assuming 8 decimals from Chainlink)
+    }
+
+    function getPricePair(address tokenA, address tokenB) public view returns (uint256 priceA, uint256 priceB) {
+        priceA = getPrice(tokenA);
+        priceB = getPrice(tokenB);
+    }
+
     function getMaxBorrowable(address token) public view returns (uint256) {
         if (totalStaked == 0) return 0;
-        (uint256 price0, uint256 price1) = priceOracle.getPricePair(address(token0), address(token1));
+        (uint256 price0, uint256 price1) = getPricePair(address(token0), address(token1));
         uint256 totalValue = (token0.balanceOf(address(this)) * price0 + token1.balanceOf(address(this)) * price1) / 1e18;
         uint256 maxBorrowValue = (totalValue * maxBorrowRatio) / 100;
         uint256 tokenPrice = token == address(token0) ? price0 : price1;
@@ -105,7 +123,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         int24 tickLower,
         int24 tickUpper
     ) external nonReentrant {
-        require(msg.sender == address(liquidityManager), "Only LiquidityManager");
+        require(msg.sender == address(liquidityManager) || msg.sender == router, "Only authorized");
         require(amount0 > 0 && amount1 > 0, "Invalid amounts");
         require(tickLower < tickUpper, "Invalid ticks");
         require(tickLower >= TickMath.MIN_TICK && tickUpper <= TickMath.MAX_TICK, "Ticks out of range");
@@ -113,7 +131,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         require(token0.transferFrom(provider, address(this), amount0), "Token0 transfer failed");
         require(token1.transferFrom(provider, address(this), amount1), "Token1 transfer failed");
 
-        (uint256 price0, uint256 price1) = priceOracle.getPricePair(address(token0), address(token1));
+        (uint256 price0, uint256 price1) = getPricePair(address(token0), address(token1));
         uint160 sqrtPriceX96 = address(token0) < address(token1)
             ? encodeSqrtPriceX96FromPrices(price0, price1)
             : encodeSqrtPriceX96FromPrices(price1, price0);
@@ -126,7 +144,6 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         emit LiquidityAdded(provider, amount0, amount1, liquidityAmount);
     }
 
-
     function swap(
         address user,
         address tokenIn,
@@ -135,14 +152,32 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         address recipient,
         uint256 deadline
     ) external nonReentrant returns (uint256 amountOut) {
+        require(msg.sender == router, "Only router");
         require(block.timestamp <= deadline, "Deadline exceeded");
         require(amountIn > 0, "Invalid amount");
         require(tokenIn == address(token0) || tokenIn == address(token1), "Invalid token");
         require(recipient != address(0), "Invalid recipient");
 
-        require(IERC20(tokenIn).transferFrom(user, address(this), amountIn), "Input token transfer failed");
+        amountOut = _calculateAmountOut(tokenIn, amountIn);
+        require(amountOut >= amountOutMin, "Insufficient output amount");
+        uint256 fee = (amountIn * swapFee) / 10000;
+        uint256 amountInAfterFee = amountIn - fee;
 
-        (uint256 price0, uint256 price1) = priceOracle.getPricePair(address(token0), address(token1));
+        if (tokenIn == address(token0)) {
+            rewardManager.allocateSwapFees(user, fee, 0);
+        } else {
+            rewardManager.allocateSwapFees(user, 0, fee);
+        }
+
+        address tokenOut = tokenIn == address(token0) ? address(token1) : address(token0);
+        require(IERC20(tokenOut).transfer(recipient, amountOut), "Output token transfer failed");
+
+        emit Swap(user, tokenIn, amountInAfterFee, amountOut, fee);
+        return amountOut;
+    }
+
+    function _calculateAmountOut(address tokenIn, uint256 amountIn) private view returns (uint256) {
+        (uint256 price0, uint256 price1) = getPricePair(address(token0), address(token1));
         uint160 sqrtPriceInX96 = tokenIn == address(token0)
             ? encodeSqrtPriceX96FromPrices(price0, price1)
             : encodeSqrtPriceX96FromPrices(price1, price0);
@@ -150,20 +185,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
             ? encodeSqrtPriceX96FromPrices(price1, price0)
             : encodeSqrtPriceX96FromPrices(price0, price1);
 
-        amountOut = SwapMath.calculateSwapOutput(amountIn, sqrtPriceInX96, sqrtPriceOutX96);
-        require(amountOut >= amountOutMin, "Insufficient output amount");
-
-        uint256 fee = (amountIn * swapFee) / 10000;
-        amountIn -= fee;
-        if (tokenIn == address(token0)) {
-            rewardManager.allocateSwapFees(user, fee, 0);
-        } else {
-            rewardManager.allocateSwapFees(user, 0, fee);
-        }
-
-        require(IERC20(tokenIn == address(token0) ? address(token1) : address(token0)).transfer(recipient, amountOut), "Output token transfer failed");
-        emit Swap(user, tokenIn, amountIn, amountOut, fee);
-        return amountOut;
+        return SwapMath.calculateSwapOutput(amountIn, sqrtPriceInX96, sqrtPriceOutX96);
     }
 
     function borrow(
@@ -173,19 +195,19 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         address collateralTokenAddress,
         uint256 collateralAmount
     ) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(amount > 0 && collateralAmount > 0, "Invalid amounts");
         require(allowedLendingTokens[token], "Token not allowed for lending");
         require(allowedCollateralTokens[collateralTokenAddress], "Token not allowed for collateral");
         require(borrowed[borrower] == 0, "Existing borrow");
 
-        uint256 collateralValue = (collateralAmount * priceOracle.getPrice(collateralTokenAddress)) / 1e18;
-        uint256 borrowValue = (amount * priceOracle.getPrice(token)) / 1e18;
+        uint256 collateralValue = (collateralAmount * getPrice(collateralTokenAddress)) / 1e18;
+        uint256 borrowValue = (amount * getPrice(token)) / 1e18;
         require(collateralValue >= borrowValue * 150 / 100, "Insufficient collateral");
 
         uint256 currentTotalBorrowed = token == address(token0) ? totalBorrowedToken0 : totalBorrowedToken1;
         require(currentTotalBorrowed + amount <= getMaxBorrowable(token), "Exceeds max borrow limit");
 
-        require(IERC20(collateralTokenAddress).transferFrom(borrower, address(this), collateralAmount), "Collateral transfer failed");
         require(IERC20(token).transfer(borrower, amount), "Borrow token transfer failed");
 
         borrowed[borrower] = amount;
@@ -203,6 +225,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     }
 
     function repay(address borrower, uint256 amount) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(borrowed[borrower] >= amount, "Invalid repay amount");
         require(borrowedToken[borrower] != address(0), "No borrow position");
 
@@ -210,7 +233,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         uint256 interest = (amount * annualInterestRate * timeElapsed) / (10000 * 365 days);
         uint256 totalRepay = amount + interest;
 
-        require(IERC20(borrowedToken[borrower]).transferFrom(msg.sender, address(this), totalRepay), "Repay transfer failed");
+        require(IERC20(borrowedToken[borrower]).transferFrom(borrower, address(this), totalRepay), "Repay transfer failed");
 
         borrowed[borrower] -= amount;
         if (borrowedToken[borrower] == address(token0)) {
@@ -231,17 +254,18 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     }
 
     function addCollateral(address user, uint256 amount) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(amount > 0, "Invalid amount");
         require(collateralToken[user] != address(0), "No existing position");
-        require(IERC20(collateralToken[user]).transferFrom(msg.sender, address(this), amount), "Collateral transfer failed");
         collateral[user] += amount;
         emit CollateralAdded(user, amount);
     }
 
     function withdrawCollateral(address user, uint256 amount) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(collateral[user] >= amount, "Insufficient collateral");
-        uint256 collateralValue = ((collateral[user] - amount) * priceOracle.getPrice(collateralToken[user])) / 1e18;
-        uint256 borrowValue = (borrowed[user] * priceOracle.getPrice(borrowedToken[user])) / 1e18;
+        uint256 collateralValue = ((collateral[user] - amount) * getPrice(collateralToken[user])) / 1e18;
+        uint256 borrowValue = (borrowed[user] * getPrice(borrowedToken[user])) / 1e18;
         require(collateralValue >= borrowValue * 150 / 100 || borrowed[user] == 0, "Insufficient collateral");
 
         collateral[user] -= amount;
@@ -277,12 +301,12 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     }
 
     function stake(address user, uint256 amount) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(amount > 0, "Invalid amount");
         require(liquidityToken.balanceOf(user) >= amount, "Insufficient liquidity tokens");
 
         updateRewards(user);
 
-        require(liquidityToken.transferFrom(user, address(this), amount), "Stake transfer failed");
         stakedBalance[user] += amount;
         totalStaked += amount;
         lastUpdateTime[user] = block.timestamp;
@@ -291,6 +315,7 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
     }
 
     function withdrawStake(address user, uint256 amount) external nonReentrant {
+        require(msg.sender == router, "Only router");
         require(amount > 0 && amount <= stakedBalance[user], "Invalid amount");
         updateRewards(user);
 

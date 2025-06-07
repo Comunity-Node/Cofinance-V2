@@ -1,35 +1,27 @@
 // SPDX-License-Identifier: MIT
-
-
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "../oracle/CustomPriceOracle.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "./CoFinanceUnifiedPool.sol";
+import "./CrosschainBridge.sol";
 
 contract LiquidationLogic is AccessControl {
     bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
 
     CoFinanceUnifiedPool public immutable pool;
-    CustomPriceOracle public immutable priceOracle;
+    CrossChainBridge public immutable crossChainBridge;
 
     uint256 public constant LIQUIDATION_THRESHOLD = 120; // 120% collateralization ratio
     uint256 public constant LIQUIDATION_BONUS = 105; // 5% bonus for liquidator
     uint256 public constant PRECISION = 100;
 
-    event Liquidation(
-        address indexed user,
-        address indexed liquidator,
-        address indexed debtToken,
-        uint256 debtAmount,
-        address collateralToken,
-        uint256 collateralAmount
-    );
+    event Liquidation(address indexed user, address indexed liquidator, address indexed debtToken, uint256 debtAmount, address collateralToken, uint256 collateralAmount);
 
-    constructor(address _pool, address _priceOracle) {
+    constructor(address _pool, address _crossChainBridge) {
         pool = CoFinanceUnifiedPool(_pool);
-        priceOracle = CustomPriceOracle(_priceOracle);
+        crossChainBridge = CrossChainBridge(_crossChainBridge);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(LIQUIDATOR_ROLE, msg.sender);
     }
@@ -50,7 +42,7 @@ contract LiquidationLogic is AccessControl {
         address collateralToken = pool.collateralToken(user);
         uint256 debtAmount = pool.borrowed(user);
         uint256 collateralAmount = pool.collateral(user);
-        uint256 debtValueInCollateral = (debtAmount * priceOracle.getPrice(debtToken)) / priceOracle.getPrice(collateralToken);
+        uint256 debtValueInCollateral = (debtAmount * pool.getPrice(debtToken)) / pool.getPrice(collateralToken);
         uint256 collateralToLiquidator = (debtValueInCollateral * LIQUIDATION_BONUS) / PRECISION;
 
         require(collateralToLiquidator <= collateralAmount, "Insufficient collateral");
@@ -67,15 +59,10 @@ contract LiquidationLogic is AccessControl {
         address collateralToken = pool.collateralToken(user);
 
         if (borrowedAmount > 0 && borrowedToken != address(0)) {
-            borrowedValue = (borrowedAmount * priceOracle.getPrice(borrowedToken)) / 1e18;
+            borrowedValue = (borrowedAmount * pool.getPrice(borrowedToken)) / 1e18;
         }
         if (collateralAmount > 0 && collateralToken != address(0)) {
-            collateralValue = (collateralAmount * priceOracle.getPrice(collateralToken)) / 1e18;
+            collateralValue = (collateralAmount * pool.getPrice(collateralToken)) / 1e18;
         }
-    }
-
-    function updateLiquidatorRole(address account, bool grant) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (grant) _grantRole(LIQUIDATOR_ROLE, account);
-        else _revokeRole(LIQUIDATOR_ROLE, account);
     }
 }

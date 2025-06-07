@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
-
-
 pragma solidity ^0.8.20;
 
 import "./CoFinanceUnifiedPool.sol";
 import "./LiquidityToken.sol";
 import "./RewardManager.sol";
 import "./LiquidityManager.sol";
+import "../interface/ILiquidityToken.sol";
 
 contract CoFinanceFactory {
     address public immutable owner;
@@ -24,7 +23,7 @@ contract CoFinanceFactory {
         address tokenB,
         string memory liquidityTokenName,
         string memory liquidityTokenSymbol,
-        address priceOracle,
+        address priceFeed, // Single price feed or oracle
         address liquidationLogic
     ) external returns (address pool) {
         require(tokenA != tokenB && tokenA != address(0) && tokenB != address(0), "Invalid tokens");
@@ -38,10 +37,12 @@ contract CoFinanceFactory {
             token0,
             token1,
             address(liquidityToken),
-            priceOracle,
+            priceFeed, // priceFeed0
+            priceFeed, // priceFeed1 (use same for simplicity or adjust as needed)
             liquidationLogic,
             address(rewardManager),
-            address(liquidityManager)
+            address(liquidityManager),
+            address(this) // Pass factory as router for simplicity
         ));
         liquidityToken.setCoFinanceContract(pool);
         rewardManager.transferOwnership(pool);

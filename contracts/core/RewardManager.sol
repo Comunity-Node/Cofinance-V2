@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: MIT
-
-
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-
-interface ILiquidityToken is IERC20 {
-    function mint(address to, uint256 amount) external;
-    function setCoFinanceContract(address _coFinanceContract) external;
-}
+import "../interface/ILiquidityToken.sol";
 
 contract RewardManager is Ownable, ReentrancyGuard {
     IERC20 public immutable token0;
@@ -41,8 +35,8 @@ contract RewardManager is Ownable, ReentrancyGuard {
         address _platformOwner
     ) Ownable(msg.sender) {
         require(_token0 != address(0) && _token1 != address(0), "Invalid token addresses");
-        require(_liquidityToken != address(0), "Invalid liquidity token");
-        require(_platformOwner != address(0), "Invalid platform owner");
+        require(_liquidityToken != address(0), "Invalid liquidity token address");
+        require(_platformOwner != address(0), "Invalid platform owner address");
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
         liquidityToken = ILiquidityToken(_liquidityToken);
@@ -50,6 +44,7 @@ contract RewardManager is Ownable, ReentrancyGuard {
     }
 
     function allocateSwapFees(address user, uint256 fee0, uint256 fee1) external onlyOwner {
+        require(user != address(0), "Invalid user address");
         uint256 totalSupply = liquidityToken.totalSupply();
         if (totalSupply == 0) return;
 
@@ -72,6 +67,7 @@ contract RewardManager is Ownable, ReentrancyGuard {
     }
 
     function allocateInterest(address user, uint256 interest0, uint256 interest1) external onlyOwner {
+        require(user != address(0), "Invalid user address");
         uint256 platformInterest0 = (interest0 * PLATFORM_FEE) / 100;
         uint256 platformInterest1 = (interest1 * PLATFORM_FEE) / 100;
         uint256 userInterest0 = interest0 - platformInterest0;
@@ -86,22 +82,23 @@ contract RewardManager is Ownable, ReentrancyGuard {
     }
 
     function claimRewards(address user) external nonReentrant {
+        require(user != address(0), "Invalid user address");
         uint256 fee0 = userFeesToken0[user];
         uint256 fee1 = userFeesToken1[user];
         uint256 interest0 = userInterestToken0[user];
         uint256 interest1 = userInterestToken1[user];
 
-        require(fee0 > 0 || fee1 > 0 || interest0 > 0 || interest1 > 0, "No rewards");
+        require(fee0 > 0 || fee1 > 0 || interest0 > 0 || interest1 > 0, "No rewards to claim");
 
         userFeesToken0[user] = 0;
         userFeesToken1[user] = 0;
         userInterestToken0[user] = 0;
         userInterestToken1[user] = 0;
 
-        if (fee0 > 0) token0.transfer(user, fee0);
-        if (fee1 > 0) token1.transfer(user, fee1);
-        if (interest0 > 0) token0.transfer(user, interest0);
-        if (interest1 > 0) token1.transfer(user, interest1);
+        if (fee0 > 0) require(token0.transfer(user, fee0), "Token0 transfer failed");
+        if (fee1 > 0) require(token1.transfer(user, fee1), "Token1 transfer failed");
+        if (interest0 > 0) require(token0.transfer(user, interest0), "Token0 interest transfer failed");
+        if (interest1 > 0) require(token1.transfer(user, interest1), "Token1 interest transfer failed");
 
         emit RewardsClaimed(user, fee0, fee1, interest0, interest1);
     }
@@ -113,17 +110,17 @@ contract RewardManager is Ownable, ReentrancyGuard {
         uint256 interest0 = platformInterestToken0;
         uint256 interest1 = platformInterestToken1;
 
-        require(fee0 > 0 || fee1 > 0 || interest0 > 0 || interest1 > 0, "No platform fees");
+        require(fee0 > 0 || fee1 > 0 || interest0 > 0 || interest1 > 0, "No platform fees to claim");
 
         platformFeesToken0 = 0;
         platformFeesToken1 = 0;
         platformInterestToken0 = 0;
         platformInterestToken1 = 0;
 
-        if (fee0 > 0) token0.transfer(platformOwner, fee0);
-        if (fee1 > 0) token1.transfer(platformOwner, fee1);
-        if (interest0 > 0) token0.transfer(platformOwner, interest0);
-        if (interest1 > 0) token1.transfer(platformOwner, interest1);
+        if (fee0 > 0) require(token0.transfer(platformOwner, fee0), "Token0 transfer failed");
+        if (fee1 > 0) require(token1.transfer(platformOwner, fee1), "Token1 transfer failed");
+        if (interest0 > 0) require(token0.transfer(platformOwner, interest0), "Token0 interest transfer failed");
+        if (interest1 > 0) require(token1.transfer(platformOwner, interest1), "Token1 interest transfer failed");
 
         emit PlatformFeesClaimed(platformOwner, fee0, fee1, interest0, interest1);
     }

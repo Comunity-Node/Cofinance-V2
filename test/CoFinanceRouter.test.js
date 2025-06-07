@@ -1,303 +1,336 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
-describe("CoFinanceRouter", function () {
-  let factory, router, deployer, user1, tokenA, tokenB, priceOracle, swapMath, tickMath, liquidityMath;
-  let pool, lendingPool, liquidityToken, liquidationLogic;
+describe("Router", function () {
+  let deployer, user, user2;
+  let tokenA, tokenB, weth, priceFeedA, priceFeedB, ccipRouter, liquidationLogic, router, pool, wethPool;
 
   beforeEach(async function () {
-    [deployer, user1] = await ethers.getSigners();
+    [deployer, user, user2] = await ethers.getSigners();
 
-    // Deploy SwapMath library
-    const SwapMathFactory = await ethers.getContractFactory("SwapMath");
-    swapMath = await SwapMathFactory.deploy();
-    await swapMath.waitForDeployment();
+    // Deploy mock tokens
+    const Token = await ethers.getContractFactory("MockERC20");
+    tokenA = await Token.deploy("Token A", "TKNA", ethers.utils.parseEther("1000000"));
+    tokenB = await Token.deploy("Token B", "TKNB", ethers.utils.parseEther("1000000"));
+    await tokenA.deployed();
+    await tokenB.deployed();
 
-    // Deploy TickMath library
-    const TickMathFactory = await ethers.getContractFactory("TickMath");
-    tickMath = await TickMathFactory.deploy();
-    await tickMath.waitForDeployment();
+    // Deploy mock WETH
+    const WETH = await ethers.getContractFactory("MockWETH");
+    weth = await WETH.deploy();
+    await weth.deployed();
 
-    // Deploy LiquidityMath library
-    const LiquidityMathFactory = await ethers.getContractFactory("LiquidityMath");
-    liquidityMath = await LiquidityMathFactory.deploy();
-    await liquidityMath.waitForDeployment();
+    // Deploy mock price feeds
+    const MockV3Aggregator = await ethers.getContractFactory("MockV3Aggregator");
+    priceFeedA = await MockV3Aggregator.deploy(8, ethers.utils.parseUnits("2000", 8)); // ETH/USD
+    priceFeedB = await MockV3Aggregator.deploy(8, ethers.utils.parseUnits("1", 8)); // USDT/USD
+    await priceFeedA.deployed();
+    await priceFeedB.deployed();
 
-    // Deploy ERC20 tokens
-    const ERC20 = await ethers.getContractFactory("GovernanceToken");
-    tokenA = await ERC20.deploy("Token A", "TKA", ethers.parseEther("1000000"));
-    await tokenA.waitForDeployment();
-    tokenB = await ERC20.deploy("Token B", "TKB", ethers.parseEther("1000000"));
-    await tokenB.waitForDeployment();
-
-    // Deploy PriceOracle
-    const PriceOracle = await ethers.getContractFactory("CustomPriceOracle");
-    priceOracle = await PriceOracle.deploy(tokenA.target, tokenB.target);
-    await priceOracle.waitForDeployment();
-    await priceOracle.setPrices(ethers.parseEther("1"), ethers.parseEther("1")); // 1:1 price
-
-    // Deploy CoFinanceFactory with linked libraries
-    const Factory = await ethers.getContractFactory("CoFinanceFactory", {
-      libraries: {
-        SwapMath: swapMath.target,
-        LiquidityMath: liquidityMath.target,
-      },
-    });
-    factory = await Factory.deploy();
-    await factory.waitForDeployment();
+    // Deploy mock CCIP router
+    const MockCCIPRouter = await ethers.getContractFactory("MockCCIPRouter");
+    ccipRouter = await MockCCIPRouter.deploy();
+    await ccipRouter.deployed();
 
     // Deploy LiquidationLogic
     const LiquidationLogic = await ethers.getContractFactory("LiquidationLogic");
-    liquidationLogic = await LiquidationLogic.deploy(ethers.ZeroAddress, priceOracle.target);
-    await liquidationLogic.waitForDeployment();
+    liquidationLogic = await LiquidationLogic.deploy(ethers.constants.AddressZero, ccipRouter.address);
+    await liquidationLogic.deployed();
 
-    // Create LendingPool via factory
-    await factory.connect(deployer).createLendingPool(
-      tokenA.target,
-      tokenB.target,
-      priceOracle.target,
-      liquidationLogic.target
-    );
-
-    // Get LendingPool address from factory
-    const lendingPoolAddr = await factory.getLendingPool(tokenA.target, tokenB.target);
-    lendingPool = await ethers.getContractAt("LendingPool", lendingPoolAddr);
-
-    // Deploy router
-    const Router = await ethers.getContractFactory("CoFinanceRouter");
-    router = await Router.deploy(factory.target);
-    await router.waitForDeployment();
+    // Deploy Router
+    const Router = await ethers.getContractFactory("Router");
+    router = await Router.deploy(ccipRouter.address);
+    await router.deployed();
 
     // Create a pool
-    const tx = await factory.connect(deployer).createPool(
-      tokenA.target,
-      tokenB.target,
-      "LiquidityToken",
-      "LPT",
-      priceOracle.target
+    const tx = await router.createPool(
+      tokenA.address,
+      tokenB.address,
+      "Liquidity Token",
+      "LP",
+      priceFeedA.address,
+      priceFeedB.address,
+      liquidationLogic.address
     );
     const receipt = await tx.wait();
-    const event = receipt.logs.find((e) => e.eventName === "PoolCreated");
-    pool = await ethers.getContractAt("CoFinancePool", event.args[0]);
-    liquidityToken = await ethers.getContractAt("LiquidityToken", event.args[3]);
+    pool = receipt.events.find((e) => e.event === "PoolCreated").args.pool;
 
-    // Distribute tokens
-    await tokenA.transfer(user1.address, ethers.parseEther("10000")).then((tx) => tx.wait());
-    await tokenB.transfer(user1.address, ethers.parseEther("10000")).then((tx) => tx.wait());
-    await tokenA.transfer(lendingPoolAddr, ethers.parseEther("1000")).then((tx) => tx.wait());
-    await tokenB.transfer(lendingPoolAddr, ethers.parseEther("1000")).then((tx) => tx.wait());
-    await tokenA.transfer(pool.target, ethers.parseEther("1000")).then((tx) => tx.wait());
-    await tokenB.transfer(pool.target, ethers.parseEther("1000")).then((tx) => tx.wait());
-
-    // Approve router and lendingPool for user1
-    await tokenA.connect(user1).approve(router.target, ethers.parseEther("10000"));
-    await tokenB.connect(user1).approve(router.target, ethers.parseEther("10000"));
-    await tokenA.connect(user1).approve(lendingPoolAddr, ethers.parseEther("10000"));
-    await tokenB.connect(user1).approve(lendingPoolAddr, ethers.parseEther("10000"));
-
-    // Verify initial balances
-    expect(await tokenA.balanceOf(user1.address)).to.equal(ethers.parseEther("10000"));
-    expect(await tokenB.balanceOf(user1.address)).to.equal(ethers.parseEther("10000"));
-    expect(await tokenA.balanceOf(lendingPoolAddr)).to.equal(ethers.parseEther("1000"));
-    expect(await tokenB.balanceOf(lendingPoolAddr)).to.equal(ethers.parseEther("1000"));
-    expect(await tokenA.balanceOf(pool.target)).to.equal(ethers.parseEther("1000"));
-    expect(await tokenB.balanceOf(pool.target)).to.equal(ethers.parseEther("1000"));
-  });
-
-  it("should deploy router with correct factory address", async function () {
-    expect(await router.factory()).to.equal(factory.target);
-  });
-
-  it("should add liquidity to a pool", async function () {
-    const amountA = ethers.parseEther("100");
-    const amountB = ethers.parseEther("100");
-    const initialBalance = await liquidityToken.balanceOf(user1.address);
-
-    const tx = await router.connect(user1).addLiquidity(
-      tokenA.target,
-      tokenB.target,
-      amountA,
-      amountB,
-      -887272,
-      887272
+    // Create a WETH pool
+    const wethTx = await router.createPool(
+      weth.address,
+      tokenB.address,
+      "WETH-TKNB LP",
+      "WETHLP",
+      priceFeedA.address,
+      priceFeedB.address,
+      liquidationLogic.address
     );
-    await expect(tx)
-      .to.emit(pool, "LiquidityAdded")
-      .withArgs(user1.address, amountA, amountB, ethers.parseEther("100"));
+    const wethReceipt = await wethTx.wait();
+    wethPool = wethReceipt.events.find((e) => e.event === "PoolCreated").args.pool;
 
-    expect(await liquidityToken.balanceOf(user1.address)).to.equal(initialBalance + ethers.parseEther("100"));
-    expect(await pool.liquidity(user1.address)).to.equal(ethers.parseEther("100"));
+    // Transfer tokens to users
+    await tokenA.transfer(user.address, ethers.utils.parseEther("1000"));
+    await tokenB.transfer(user.address, ethers.utils.parseEther("1000"));
+    await tokenA.transfer(user2.address, ethers.utils.parseEther("1000"));
+    await tokenB.transfer(user2.address, ethers.utils.parseEther("1000"));
+
+    // Approve tokens
+    await tokenA.connect(user).approve(router.address, ethers.utils.parseEther("1000"));
+    await tokenB.connect(user).approve(router.address, ethers.utils.parseEther("1000"));
+    await tokenA.connect(user2).approve(router.address, ethers.utils.parseEther("1000"));
+    await tokenB.connect(user2).approve(router.address, ethers.utils.parseEther("1000"));
+    await tokenA.connect(user).approve(pool, ethers.utils.parseEther("1000"));
+    await tokenB.connect(user).approve(pool, ethers.utils.parseEther("1000"));
   });
 
-  it("should revert adding liquidity to non-existent pool", async function () {
-    const tokenC = await (await ethers.getContractFactory("GovernanceToken")).deploy(
-      "Token C",
-      "TKC",
-      ethers.parseEther("1000000")
+  it("should create a pool", async function () {
+    expect(pool).to.not.equal(ethers.constants.AddressZero);
+    expect(await router.getPool(tokenA.address, tokenB.address)).to.equal(pool);
+    expect(await router.getAllPools()).to.have.lengthOf(2); // Including WETH pool
+  });
+
+  it("should add liquidity", async function () {
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
     );
-    await tokenC.waitForDeployment();
-    await tokenC.connect(user1).approve(router.target, ethers.parseEther("10000"));
-
-    await expect(
-      router.connect(user1).addLiquidity(
-        tokenA.target,
-        tokenC.target,
-        ethers.parseEther("100"),
-        ethers.parseEther("100"),
-        -887272,
-        887272
-      )
-    ).to.be.revertedWith("Pool does not exist");
+    expect(await poolContract.liquidity(user.address)).to.be.gt(0);
   });
 
-  it("should swap tokens", async function () {
-    await router.connect(user1).addLiquidity(
-      tokenA.target,
-      tokenB.target,
-      ethers.parseEther("100"),
-      ethers.parseEther("100"),
-      -887272,
-      887272
+  it("should perform a swap", async function () {
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
     );
 
-    const amountIn = ethers.parseEther("10");
-    const minAmountOut = ethers.parseEther("5");
-    const amountOut = ethers.parseEther("9.9"); // 1% fee: 10 * 0.99
-    const initialBalanceB = await tokenB.balanceOf(user1.address);
-
-    const tx = await router.connect(user1).swap(
-      tokenA.target,
-      tokenB.target,
-      tokenA.target,
-      amountIn,
-      minAmountOut
+    const balanceBefore = await tokenB.balanceOf(user.address);
+    await router.connect(user).swapExactInput(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("10"),
+      0,
+      user.address,
+      Math.floor(Date.now() / 1000) + 3600
     );
-    await expect(tx)
-      .to.emit(pool, "Swap")
-      .withArgs(user1.address, tokenA.target, amountIn, amountOut);
-
-    expect(await tokenB.balanceOf(user1.address)).to.equal(initialBalanceB + amountOut);
-    expect(await tokenA.balanceOf(user1.address)).to.equal(ethers.parseEther("10000") - amountIn);
+    const balanceAfter = await tokenB.balanceOf(user.address);
+    expect(balanceAfter).to.be.gt(balanceBefore);
   });
 
-  it("should revert swap with invalid token", async function () {
-    const tokenC = await (await ethers.getContractFactory("GovernanceToken")).deploy(
-      "Token C",
-      "TKC",
-      ethers.parseEther("1000000")
-    );
-    await tokenC.waitForDeployment();
-
-    await expect(
-      router.connect(user1).swap(
-        tokenA.target,
-        tokenB.target,
-        tokenC.target,
-        ethers.parseEther("10"),
-        ethers.parseEther("5")
-      )
-    ).to.be.revertedWith("Invalid input token");
-  });
-
-  it("should revert swap with insufficient output amount", async function () {
-    await router.connect(user1).addLiquidity(
-      tokenA.target,
-      tokenB.target,
-      ethers.parseEther("100"),
-      ethers.parseEther("100"),
-      -887272,
-      887272
+  it("should perform a swap with native ETH", async function () {
+    await weth.connect(user).deposit({ value: ethers.utils.parseEther("1") });
+    await weth.connect(user).approve(wethPool, ethers.utils.parseEther("1"));
+    await tokenB.connect(user).approve(wethPool, ethers.utils.parseEther("100"));
+    await router.connect(user).addLiquiditySingleToken(
+      wethPool,
+      weth.address,
+      tokenB.address,
+      ethers.utils.parseEther("1"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
     );
 
-    await expect(
-      router.connect(user1).swap(
-        tokenA.target,
-        tokenB.target,
-        tokenA.target,
-        ethers.parseEther("10"),
-        ethers.parseEther("20")
-      )
-    ).to.be.revertedWith("Insufficient output amount");
-  });
-
-  it("should borrow with collateral", async function () {
-    const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("150");
-    const initialBalanceA = await tokenA.balanceOf(user1.address);
-    const initialBalanceB = await tokenB.balanceOf(user1.address);
-
-    await expect(
-      router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount)
-    )
-      .to.emit(lendingPool, "Borrow")
-      .withArgs(user1.address, tokenA.target, borrowAmount, tokenB.target, collateralAmount);
-
-    expect(await lendingPool.borrowed(user1.address)).to.equal(borrowAmount);
-    expect(await lendingPool.collateral(user1.address)).to.equal(collateralAmount);
-    expect(await lendingPool.borrowedToken(user1.address)).to.equal(tokenA.target);
-    expect(await lendingPool.collateralToken(user1.address)).to.equal(tokenB.target);
-    expect(await tokenA.balanceOf(user1.address)).to.equal(initialBalanceA + borrowAmount);
-    expect(await tokenB.balanceOf(user1.address)).to.equal(initialBalanceB - collateralAmount);
-  });
-
-  it("should revert borrow with non-existent lending pool", async function () {
-    const tokenC = await (await ethers.getContractFactory("GovernanceToken")).deploy(
-      "Token C",
-      "TKC",
-      ethers.parseEther("1000000")
+    const balanceBefore = await tokenB.balanceOf(user.address);
+    await router.connect(user).swapExactInputWithNative(
+      wethPool,
+      tokenB.address,
+      0,
+      user.address,
+      Math.floor(Date.now() / 1000) + 3600,
+      { value: ethers.utils.parseEther("0.1") }
     );
-    await tokenC.waitForDeployment();
-    await tokenC.connect(user1).approve(router.target, ethers.parseEther("10000"));
-
-    await expect(
-      router.connect(user1).borrow(tokenA.target, ethers.parseEther("100"), tokenC.target, ethers.parseEther("150"))
-    ).to.be.revertedWith("Lending pool does not exist");
+    const balanceAfter = await tokenB.balanceOf(user.address);
+    expect(balanceAfter).to.be.gt(balanceBefore);
   });
 
-  it("should repay borrowed amount", async function () {
-    const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("150");
-    await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
+  it("should borrow tokens", async function () {
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
 
-    await router.connect(user1).repay(tokenA.target, tokenB.target, borrowAmount);
+    await router.connect(user).borrow(
+      pool,
+      tokenA.address,
+      ethers.utils.parseEther("10"),
+      tokenB.address,
+      ethers.utils.parseEther("50")
+    );
 
-    expect(await lendingPool.borrowed(user1.address)).to.equal(0);
-    expect(await lendingPool.collateral(user1.address)).to.equal(collateralAmount);
-    expect(await lendingPool.borrowedToken(user1.address)).to.equal(ethers.ZeroAddress);
-    expect(await lendingPool.collateralToken(user1.address)).to.equal(ethers.ZeroAddress);
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    expect(await poolContract.borrowed(user.address)).to.equal(ethers.utils.parseEther("10"));
+    expect(await poolContract.collateral(user.address)).to.equal(ethers.utils.parseEther("50"));
   });
 
-  it("should add collateral", async function () {
-    const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("150");
-    const additionalCollateral = ethers.parseEther("50");
-    await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
+  it("should repay a loan", async function () {
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
 
-    await router.connect(user1).addCollateral(tokenB.target, tokenA.target, additionalCollateral);
+    await router.connect(user).borrow(
+      pool,
+      tokenA.address,
+      ethers.utils.parseEther("10"),
+      tokenB.address,
+      ethers.utils.parseEther("50")
+    );
 
-    expect(await lendingPool.collateral(user1.address)).to.equal(collateralAmount + additionalCollateral);
+    await tokenA.connect(user).approve(pool, ethers.utils.parseEther("11")); // Include interest
+    await router.connect(user).repay(pool, ethers.utils.parseEther("10"));
+
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    expect(await poolContract.borrowed(user.address)).to.equal(0);
   });
 
-  it("should withdraw collateral", async function () {
-    const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("200");
-    const withdrawAmount = ethers.parseEther("25");
-    await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
+  it("should stake liquidity tokens", async function () {
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
 
-    const initialBalanceB = await tokenB.balanceOf(user1.address);
-    await router.connect(user1).withdrawCollateral(tokenB.target, tokenA.target, withdrawAmount);
-
-    expect(await lendingPool.collateral(user1.address)).to.equal(collateralAmount - withdrawAmount);
-    expect(await tokenB.balanceOf(user1.address)).to.equal(initialBalanceB + withdrawAmount);
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    const liquidityToken = await ethers.getContractAt("LiquidityToken", await poolContract.liquidityToken());
+    await liquidityToken.connect(user).approve(pool, ethers.utils.parseEther("10"));
+    await router.connect(user).stake(pool, ethers.utils.parseEther("10"));
+    expect(await poolContract.stakedBalance(user.address)).to.equal(ethers.utils.parseEther("10"));
   });
 
-  it("should revert withdraw with insufficient collateral", async function () {
-    const borrowAmount = ethers.parseEther("100");
-    const collateralAmount = ethers.parseEther("150");
-    await router.connect(user1).borrow(tokenA.target, borrowAmount, tokenB.target, collateralAmount);
+  it("should withdraw staked tokens", async function () {
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
 
-    await expect(
-      router.connect(user1).withdrawCollateral(tokenB.target, tokenA.target, ethers.parseEther("100"))
-    ).to.be.revertedWith("Insufficient collateral after withdrawal");
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    const liquidityToken = await ethers.getContractAt("LiquidityToken", await poolContract.liquidityToken());
+    await liquidityToken.connect(user).approve(pool, ethers.utils.parseEther("10"));
+    await router.connect(user).stake(pool, ethers.utils.parseEther("10"));
+
+    await router.connect(user).withdrawStake(pool, ethers.utils.parseEther("10"));
+    expect(await poolContract.stakedBalance(user.address)).to.equal(0);
+  });
+
+  it("should perform a cross-chain swap", async function () {
+    // Set up destination contract
+    await router.setDestinationContract(1234, router.address); // Mock chain selector
+
+    // Add liquidity to pool
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
+
+    // Perform cross-chain swap
+    const balanceBefore = await tokenB.balanceOf(user.address);
+    await router.connect(user).swapExactInputCrossChain(
+      tokenA.address,
+      ethers.utils.parseEther("10"),
+      1234,
+      user.address,
+      Math.floor(Date.now() / 1000) + 3600,
+      { value: ethers.utils.parseEther("0.01") }
+    );
+
+    // Simulate CCIP message receipt
+    const message = {
+      messageId: ethers.utils.formatBytes32String("test"),
+      sourceChainSelector: 1234,
+      sender: ethers.utils.hexZeroPad(router.address, 32),
+      data: router.interface.encodeFunctionData("executeCrossChainSwap", [
+        user.address,
+        tokenA.address,
+        ethers.utils.parseEther("10"),
+        user.address,
+      ]),
+      destTokenAmounts: [],
+    };
+    await ccipRouter.simulateReceive(router.address, message);
+
+    const balanceAfter = await tokenB.balanceOf(user.address);
+    expect(balanceAfter).to.be.gt(balanceBefore);
+  });
+
+  it("should perform a cross-chain loan", async function () {
+    // Set up destination contract
+    await router.setDestinationContract(1234, router.address);
+
+    // Add liquidity to pool
+    await router.connect(user).addLiquiditySingleToken(
+      pool,
+      tokenA.address,
+      tokenB.address,
+      ethers.utils.parseEther("100"),
+      -1000,
+      1000,
+      Math.floor(Date.now() / 1000) + 3600
+    );
+
+    // Request cross-chain loan
+    await router.connect(user).requestCrossChainLoan(
+      tokenB.address,
+      ethers.utils.parseEther("50"),
+      1234,
+      tokenA.address,
+      ethers.utils.parseEther("10"),
+      { value: ethers.utils.parseEther("0.01") }
+    );
+
+    // Simulate CCIP message receipt
+    const message = {
+      messageId: ethers.utils.formatBytes32String("test-loan"),
+      sourceChainSelector: 1234,
+      sender: ethers.utils.hexZeroPad(router.address, 32),
+      data: router.interface.encodeFunctionData("executeCrossChainLoan", [
+        user.address,
+        tokenB.address,
+        ethers.utils.parseEther("50"),
+        tokenA.address,
+        ethers.utils.parseEther("10"),
+      ]),
+      destTokenAmounts: [],
+    };
+    await ccipRouter.simulateReceive(router.address, message);
+
+    const poolContract = await ethers.getContractAt("CoFinanceUnifiedPool", pool);
+    expect(await poolContract.borrowed(user.address)).to.equal(ethers.utils.parseEther("10"));
+    expect(await poolContract.collateral(user.address)).to.equal(ethers.utils.parseEther("50"));
   });
 });
