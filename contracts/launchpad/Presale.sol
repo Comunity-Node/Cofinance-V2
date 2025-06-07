@@ -56,18 +56,15 @@ contract Launchpad is Ownable {
     function buyTokens(uint256 paymentAmount) external {
         require(block.timestamp >= startTime && block.timestamp <= endTime, "Sale not active");
         require(paymentAmount >= minPurchase && paymentAmount <= maxPurchase, "Invalid amount");
-
         uint256 tokensToBuy = (paymentAmount * 1e18) / tokenPrice;
-
-        uint256 totalTokensSold = ((totalRaised + paymentAmount) * 1e18) / tokenPrice;
+        uint256 totalTokensSold = purchasedTokens[msg.sender] + tokensToBuy;
         require(totalTokensSold <= totalTokensForSale, "Exceeds total tokens");
-
         require(paymentToken.transferFrom(msg.sender, address(this), paymentAmount), "Payment transfer failed");
         purchasedTokens[msg.sender] += tokensToBuy;
         totalRaised += paymentAmount;
-
         emit TokensPurchased(msg.sender, tokensToBuy, paymentAmount);
     }
+
 
 
     function finalizeSale() external onlyOwner {

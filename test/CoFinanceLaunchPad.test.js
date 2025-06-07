@@ -9,9 +9,8 @@ describe("Launchpad", function () {
   beforeEach(async function () {
     [deployer, user1, user2] = await ethers.getSigners();
 
-    const ERC20 = await ethers.getContractFactory("GovernanceToken");
-    saleToken = await ERC20.deploy("Sale Token", "SLT", ethers.parseEther("1000000"));
-    await saleToken.waitForDeployment();
+    const ERC20 = await ethers.getContractFactory("Token");
+    saleToken = await ERC20.deploy();
     paymentToken = await ERC20.deploy("Payment Token", "PTK", ethers.parseEther("1000000"));
     await paymentToken.waitForDeployment();
 

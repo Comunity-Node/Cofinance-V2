@@ -1,40 +1,46 @@
 // SPDX-License-Identifier: MIT
+
+
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./CustomPriceFeed.sol";
 
 contract CustomPriceOracle is Ownable {
-    address public token0;
-    address public token1;
-    uint256 public price0; // Price of token0 in token1 (18 decimals)
-    uint256 public price1; // Price of token1 in token0 (18 decimals)
-    uint256 public lastUpdate;
+    // Mapping of token addresses to CustomPriceFeed contracts
+    mapping(address => address) public priceFeeds;
 
-    event PriceUpdated(address indexed token, uint256 price, uint256 timestamp);
+    event PriceFeedUpdated(address indexed token, address indexed priceFeed);
 
-    constructor(address _token0, address _token1) Ownable(msg.sender) {
-        token0 = _token0;
-        token1 = _token1;
-        price0 = 1e18; // Initial 1:1 price
-        price1 = 1e18;
-        lastUpdate = block.timestamp;
+    constructor() Ownable(msg.sender) {}
+
+    // Set or update the price feed for a token
+    function setPriceFeed(address token, address priceFeed) external onlyOwner {
+        require(token != address(0), "Invalid token address");
+        require(priceFeed != address(0), "Invalid price feed address");
+        priceFeeds[token] = priceFeed;
+        emit PriceFeedUpdated(token, priceFeed);
     }
 
-    function setPrices(uint256 _price0, uint256 _price1) external onlyOwner {
-        require(_price0 > 0 && _price1 > 0, "Invalid prices");
-        price0 = _price0;
-        price1 = _price1;
-        lastUpdate = block.timestamp;
-        emit PriceUpdated(token0, _price0, block.timestamp);
-        emit PriceUpdated(token1, _price1, block.timestamp);
+    // Get prices for a token pair (e.g., token0 and token1 in USD)
+    function getPricePair(address token0, address token1) external view returns (uint256 price0, uint256 price1) {
+        require(priceFeeds[token0] != address(0), "No price feed for token0");
+        require(priceFeeds[token1] != address(0), "No price feed for token1");
+
+        price0 = getPrice(token0);
+        price1 = getPrice(token1);
     }
 
-    function getPrice(address token) external view returns (uint256) {
-        require(token == token0 || token == token1, "Invalid token");
-        return token == token0 ? price0 : price1;
-    }
+    // Get price for a single token (e.g., in USD, scaled to 1e18)
+    function getPrice(address token) public view returns (uint256) {
+        require(priceFeeds[token] != address(0), "No price feed for token");
 
-    function getPricePair() external view returns (uint256, uint256) {
-        return (price0, price1);
+        CustomPriceFeed priceFeed = CustomPriceFeed(priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        require(price > 0, "Invalid price from feed");
+
+        // Scale price to 1e18 (assuming feed provides 8 decimals)
+        uint8 decimals = priceFeed.decimals();
+        return uint256(price) * 10 ** (18 - decimals);
     }
 }
