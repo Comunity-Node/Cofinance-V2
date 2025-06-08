@@ -98,8 +98,8 @@ contract CoFinanceUnifiedPool is AccessControl, ReentrancyGuard {
         AggregatorV3Interface priceFeed = token == address(token0) ? priceFeed0 : priceFeed1;
         (, int256 price,, uint256 timeStamp,) = priceFeed.latestRoundData();
         require(price > 0, "Invalid price");
-        require(block.timestamp <= timeStamp + 3600, "Stale price data"); // 1-hour staleness check
-        return uint256(price) * 1e10; // Adjust to 18 decimals (assuming 8 decimals from Chainlink)
+        require(block.timestamp <= timeStamp + 3600, "Stale price data"); 
+        return uint256(price) * 1e10; 
     }
 
     function getPricePair(address tokenA, address tokenB) public view returns (uint256 priceA, uint256 priceB) {

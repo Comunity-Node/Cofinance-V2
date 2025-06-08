@@ -17,22 +17,18 @@ import "./LiquidationLogic.sol";
 import "../libraries/TickMath.sol";
 import "../libraries/LiquidityMath.sol";
 import "../libraries/SwapMath.sol";
-import "../interface/ILiquidityToken.sol"; // Import the interface
+import "../interface/ILiquidityToken.sol";
 
 contract CoFinanceRouter is ReentrancyGuard, AccessControl {
     using Math for uint256;
 
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
     address public immutable owner;
-    address[] public allPools;
-    mapping(address => mapping(address => address)) public pools;
-
-    // Chainlink CCIP Router
-    IRouterClient public immutable ccipRouter; // Make immutable for gas optimization
-    mapping(uint64 => address) public destinationContracts; // Chain selector to destination contract
+    CoFinanceFactory public immutable factory;
+    IRouterClient public immutable ccipRouter;
+    mapping(uint64 => address) public destinationContracts;
     mapping(bytes32 => bool) public processedMessages;
 
-    event PoolCreated(address indexed pool, address indexed token0, address indexed token1, address liquidityToken, address rewardManager, address liquidityManager);
     event TokensBridged(address indexed user, address token, uint256 amount, uint64 destinationChain, bytes32 messageId);
     event CrossChainSwapInitiated(address indexed user, address tokenIn, uint256 amountIn, uint64 destinationChain);
     event CrossChainLoanRequested(address indexed user, address collateralToken, uint256 collateralAmount, uint64 destinationChain);
@@ -47,53 +43,16 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
     event ParametersUpdated(address indexed pool, uint256 swapFee, uint256 interestRate, uint256 maxBorrowRatio);
     event TokenStatusUpdated(address indexed pool, address token, bool canLend, bool canCollateral);
 
-    constructor(address _ccipRouter) {
+    constructor(address _ccipRouter, address _factory) {
         require(_ccipRouter != address(0), "Invalid CCIP router address");
+        require(_factory != address(0), "Invalid factory address");
         owner = msg.sender;
         ccipRouter = IRouterClient(_ccipRouter);
+        factory = CoFinanceFactory(_factory);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(MANAGER_ROLE, msg.sender);
     }
 
-    // Factory Functions
-    function createPool(
-        address tokenA,
-        address tokenB,
-        string memory liquidityTokenName,
-        string memory liquidityTokenSymbol,
-        address priceFeedA,
-        address priceFeedB,
-        address liquidationLogic
-    ) external onlyRole(MANAGER_ROLE) returns (address pool) {
-        require(tokenA != tokenB && tokenA != address(0) && tokenB != address(0), "Invalid tokens");
-        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        require(pools[token0][token1] == address(0), "Pool exists");
-
-        LiquidityToken liquidityToken = new LiquidityToken(liquidityTokenName, liquidityTokenSymbol);
-        RewardManager rewardManager = new RewardManager(token0, token1, address(liquidityToken), owner);
-        LiquidityManager liquidityManager = new LiquidityManager(address(this));
-        pool = address(new CoFinanceUnifiedPool(
-            token0,
-            token1,
-            address(liquidityToken),
-            priceFeedA,
-            priceFeedB,
-            liquidationLogic,
-            address(rewardManager),
-            address(liquidityManager),
-            address(this)
-        ));
-        liquidityToken.setCoFinanceContract(pool);
-        rewardManager.transferOwnership(pool);
-        liquidityManager.transferOwnership(pool);
-        pools[token0][token1] = pool;
-        allPools.push(pool);
-
-        emit PoolCreated(pool, token0, token1, address(liquidityToken), address(rewardManager), address(liquidityManager));
-        return pool;
-    }
-
-    // Pool Interaction Functions
     function swapExactInput(
         address pool,
         address tokenIn,
@@ -104,8 +63,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         uint256 deadline
     ) external nonReentrant returns (uint256 amountOut) {
         require(block.timestamp <= deadline, "Deadline exceeded");
-        require(pools[tokenIn][tokenOut] == pool || pools[tokenOut][tokenIn] == pool, "Invalid pool");
-
+        require(factory.getPool(tokenIn, tokenOut) == pool, "Invalid pool");
         require(IERC20(tokenIn).transferFrom(msg.sender, pool, amountIn), "Token transfer failed");
 
         amountOut = CoFinanceUnifiedPool(pool).swap(
@@ -132,7 +90,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         require(msg.value > 0, "No ETH sent");
 
         address token0 = CoFinanceUnifiedPool(pool).getToken0();
-        require(pools[token0][tokenOut] == pool, "Invalid pool");
+        require(factory.getPool(token0, tokenOut) == pool, "Invalid pool");
         IWETH weth = IWETH(token0);
         require(token0 == address(weth), "Pool token0 must be WETH");
 
@@ -162,8 +120,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         uint256 deadline
     ) external nonReentrant {
         require(block.timestamp <= deadline, "Deadline exceeded");
-        require(pools[tokenIn][tokenOut] == pool || pools[tokenOut][tokenIn] == pool, "Invalid pool");
-
+        require(factory.getPool(tokenIn, tokenOut) == pool, "Invalid pool");
         require(IERC20(tokenIn).transferFrom(msg.sender, pool, amountIn), "Token transfer failed");
 
         (uint256 amount0, uint256 amount1) = _handleLiquiditySwap(pool, tokenIn, amountIn, deadline);
@@ -185,26 +142,34 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         uint256 amountIn,
         uint256 deadline
     ) private returns (uint256 amount0, uint256 amount1) {
-        address token0 = CoFinanceUnifiedPool(pool).getToken0();
-        address token1 = CoFinanceUnifiedPool(pool).getToken1();
-
-        (uint256 price0, uint256 price1) = CoFinanceUnifiedPool(pool).getPricePair(token0, token1);
+        CoFinanceUnifiedPool poolContract = CoFinanceUnifiedPool(pool);
+        address token0 = poolContract.getToken0();
+        (uint256 price0, uint256 price1) = poolContract.getPricePair(token0, poolContract.getToken1());
 
         if (tokenIn == token0) {
             amount0 = amountIn / 2;
             amount1 = (amount0 * price0) / price1;
             uint256 swapAmount = amountIn - amount0;
             if (swapAmount > 0) {
-                CoFinanceUnifiedPool(pool).swap(msg.sender, tokenIn, swapAmount, 0, pool, deadline);
+                _executeSwap(poolContract, tokenIn, swapAmount, deadline);
             }
         } else {
             amount1 = amountIn / 2;
             amount0 = (amount1 * price1) / price0;
             uint256 swapAmount = amountIn - amount1;
             if (swapAmount > 0) {
-                CoFinanceUnifiedPool(pool).swap(msg.sender, tokenIn, swapAmount, 0, pool, deadline);
+                _executeSwap(poolContract, tokenIn, swapAmount, deadline);
             }
         }
+    }
+
+    function _executeSwap(
+        CoFinanceUnifiedPool poolContract,
+        address tokenIn,
+        uint256 swapAmount,
+        uint256 deadline
+    ) private {
+        poolContract.swap(msg.sender, tokenIn, swapAmount, 0, address(poolContract), deadline);
     }
 
     function borrow(
@@ -214,7 +179,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         address collateralToken,
         uint256 collateralAmount
     ) external nonReentrant {
-        require(pools[token][collateralToken] == pool || pools[collateralToken][token] == pool, "Invalid pool");
+        require(factory.getPool(token, collateralToken) == pool, "Invalid pool");
         require(IERC20(collateralToken).transferFrom(msg.sender, pool, collateralAmount), "Collateral transfer failed");
         CoFinanceUnifiedPool(pool).borrow(msg.sender, token, amount, collateralToken, collateralAmount);
         emit Borrow(pool, msg.sender, token, amount, collateralToken, collateralAmount);
@@ -264,7 +229,6 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         emit TokenStatusUpdated(pool, token, canLend, canCollateral);
     }
 
-    // Cross-Chain Functions
     function setDestinationContract(uint64 chainSelector, address destination) external onlyRole(MANAGER_ROLE) {
         require(destination != address(0), "Invalid destination address");
         destinationContracts[chainSelector] = destination;
@@ -272,6 +236,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
 
     function swapExactInputCrossChain(
         address tokenIn,
+        address tokenOut, // Added tokenOut
         uint256 amountIn,
         uint64 destinationChainSelector,
         address recipient,
@@ -284,10 +249,11 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
             receiver: abi.encode(destinationContracts[destinationChainSelector]),
             data: abi.encodeWithSelector(
-                bytes4(keccak256("executeCrossChainSwap(address,address,uint256,address)")),
+                bytes4(keccak256("executeCrossChainSwap(address,address,uint256,address,address)")),
                 msg.sender,
                 tokenIn,
                 amountIn,
+                tokenOut,
                 recipient
             ),
             tokenAmounts: new Client.EVMTokenAmount[](1),
@@ -299,6 +265,30 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         bytes32 messageId = ccipRouter.ccipSend{value: msg.value}(destinationChainSelector, message);
 
         emit CrossChainSwapInitiated(msg.sender, tokenIn, amountIn, destinationChainSelector);
+    }
+
+    function executeCrossChainSwap(
+        address user,
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut,
+        address recipient
+    ) external {
+        require(msg.sender == address(this), "Only self via CCIP");
+        address pool = factory.getPool(tokenIn, tokenOut);
+        require(pool != address(0), "Pool does not exist");
+
+        require(IERC20(tokenIn).transfer(pool, amountIn), "Token transfer failed");
+        uint256 amountOut = CoFinanceUnifiedPool(pool).swap(
+            user,
+            tokenIn,
+            amountIn,
+            0,
+            recipient,
+            block.timestamp
+        );
+
+        emit Swap(pool, user, tokenIn, amountIn, amountOut, CoFinanceUnifiedPool(pool).swapFee());
     }
 
     function requestCrossChainLoan(
@@ -343,10 +333,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
 
     function executeCrossChainSwap(address user, address tokenIn, uint256 amountIn, address recipient) external {
         require(msg.sender == address(this), "Only self via CCIP");
-        address token0 = CoFinanceUnifiedPool(allPools[0]).getToken0();
-        address token1 = CoFinanceUnifiedPool(allPools[0]).getToken1();
-        address tokenOut = tokenIn == token0 ? token1 : token0;
-        address pool = CoFinanceFactory.getPool(tokenIn, tokenOut);
+        address pool = factory.getPool(tokenIn, recipient);
         require(pool != address(0), "Pool does not exist");
 
         require(IERC20(tokenIn).transfer(pool, amountIn), "Token transfer failed");
@@ -370,7 +357,7 @@ contract CoFinanceRouter is ReentrancyGuard, AccessControl {
         uint256 borrowAmount
     ) external {
         require(msg.sender == address(this), "Only self via CCIP");
-        address pool = CoFinanceFactory.getPool(tokenToBorrow, collateralToken);
+        address pool = factory.getPool(tokenToBorrow, collateralToken);
         require(pool != address(0), "Pool does not exist");
 
         require(IERC20(collateralToken).transfer(pool, collateralAmount), "Collateral transfer failed");
